@@ -1,0 +1,35 @@
+# docker-compose.yml d'Icarus, version « pilotable par warden-icarus ».
+# Différences avec l'original : chaque réglage vient du .env (${VAR}) pour que le bot ne
+# réécrive que le .env, et stop_grace_period laisse 90 s au jeu pour sauvegarder.
+services:
+  icarus:
+    image: nerodon/icarus-dedicated:latest
+    container_name: icarus
+    hostname: icarus
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 90s
+    ports:
+      - "32768:32768/udp"
+      - "32784:32784/udp"
+    volumes:
+      - ./data:/home/steam/.wine/drive_c/icarus
+      - ./game:/game/icarus
+    environment:
+      - SERVERNAME=${SERVERNAME}
+      - PORT=32768
+      - QUERYPORT=32784
+      - JOIN_PASSWORD=${JOIN_PASSWORD}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - MAX_PLAYERS=${MAX_PLAYERS}
+      - SHUTDOWN_NOT_JOINED_FOR=${SHUTDOWN_NOT_JOINED_FOR}
+      - SHUTDOWN_EMPTY_FOR=${SHUTDOWN_EMPTY_FOR}
+      - ALLOW_NON_ADMINS_LAUNCH=${ALLOW_NON_ADMINS_LAUNCH}
+      - ALLOW_NON_ADMINS_DELETE=${ALLOW_NON_ADMINS_DELETE}
+      - RESUME_PROSPECT=${RESUME_PROSPECT}
+      - SAVEGAMEONEXIT=${SAVEGAMEONEXIT}
+      - GAMESAVEFREQUENCY=${GAMESAVEFREQUENCY}
+      - FIBERFOLIAGERESPAWN=${FIBERFOLIAGERESPAWN}
+      - LARGESTONERESPAWN=${LARGESTONERESPAWN}
+      - STEAM_USERID=1000
+      - STEAM_GROUPID=1000

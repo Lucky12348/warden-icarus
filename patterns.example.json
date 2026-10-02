@@ -1,0 +1,5 @@
+{
+  "join": ["LogNet: Join succeeded: (?P<name>.+)"],
+  "leave": ["LogNet: .*Player (?P<name>.+) (?:left|disconnected)"],
+  "startup": ["Engine is initialized", "Success! App '2089300' already up to date"]
+}
