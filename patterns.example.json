@@ -1,4 +1,16 @@
 {
+  "ignore": [
+    "^\\s*$",
+    "^[0-9a-f]{4}:(?:fixme|err|warn|trace):",
+    "^(?:fixme|err|warn|trace):",
+    "setlocale\\(",
+    "XDG_RUNTIME_DIR",
+    "LogFMOD:",
+    "LogStreaming: Error",
+    "LogProperty: Error: Struct type unknown",
+    "LogStringTable: Warning",
+    "CheatFunctions|FunctionalTesting|AutomationScreenshot"
+  ],
   "join": ["LogNet: Join succeeded: (?P<name>.+)"],
   "leave": ["LogNet: .*Player (?P<name>.+) (?:left|disconnected)"],
   "startup": ["Engine is initialized", "Success! App '2089300' already up to date"]

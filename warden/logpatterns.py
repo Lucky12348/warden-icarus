@@ -16,8 +16,22 @@ from pathlib import Path
 CATEGORIES = ("ignore", "crash", "join", "leave", "update", "startup", "error")
 
 DEFAULT_PATTERNS: dict[str, list[str]] = {
-    # Bruit de Wine (« 0024:fixme:… », « err:ole:… ») et lignes vides.
-    "ignore": [r"^\s*$", r"^[0-9a-f]{4}:(?:fixme|err|warn|trace):", r"^(?:fixme|err|warn|trace):"],
+    # Évaluée en premier : une ligne ignorée n'est ni diffusée ni comptée (erreur, anti-spam).
+    # Si le fichier de motifs définit "ignore", sa liste remplace entièrement celle-ci.
+    "ignore": [
+        # Lignes vides et bruit de Wine (« 0024:fixme:… », « err:ole:… »).
+        r"^\s*$",
+        r"^[0-9a-f]{4}:(?:fixme|err|warn|trace):",
+        r"^(?:fixme|err|warn|trace):",
+        # Bruit normal d'Unreal Engine sous Wine (faux « ❌ »).
+        r"setlocale\(",
+        r"XDG_RUNTIME_DIR",
+        r"LogFMOD:",
+        r"LogStreaming: Error",
+        r"LogProperty: Error: Struct type unknown",
+        r"LogStringTable: Warning",
+        r"CheatFunctions|FunctionalTesting|AutomationScreenshot",
+    ],
     "crash": [
         r"=== Critical error",
         r"(?i)\bsegmentation fault\b",
@@ -48,7 +62,7 @@ LABELS = {
     "join": "👋",
     "leave": "🚪",
     "update": "⬆️",
-    "startup": "🚀",
+    "startup": "✅",
     "error": "❌",
 }
 

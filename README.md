@@ -136,7 +136,7 @@ Le cycle normal de l'image ne déclenche **aucune** alerte : serveur vide, arrê
 Activé par défaut à **06:00 (Europe/Paris)**, l'heure se change dans le salon réglages. Le bot l'annonce dans le salon logs 5 min avant. Si des joueurs sont connectés, ou si A2S ne répond pas, il ne redémarre pas et réessaie toutes les 15 min pendant 2 h au maximum, puis abandonne pour la journée. Un serveur déjà arrêté n'est pas relancé.
 
 ### Logs du conteneur
-Seules les lignes importantes sont diffusées : démarrage, mise à jour, erreurs, crash. Le bruit de Wine (`fixme:`/`err:`) est ignoré. Les lignes sont regroupées toutes les 5 s, avec deux limites anti-spam : une même ligne au plus toutes les 5 min (`LOG_DEDUPE_SECONDS`) et au plus 10 lignes par minute (`LOG_MAX_PER_MINUTE`). Le nombre de lignes ignorées est indiqué.
+Seules les lignes importantes sont diffusées : démarrage, mise à jour, erreurs, crash. Le bruit normal de Wine et d'Unreal (`fixme:`/`err:`, `setlocale(`, `XDG_RUNTIME_DIR`, `LogFMOD:`, `LogStreaming: Error`…) est ignoré grâce à la catégorie `ignore` : ces lignes ne sont ni diffusées ni comptées par l'anti-spam. Les lignes sont regroupées toutes les 5 s, avec deux limites anti-spam : une même ligne au plus toutes les 5 min (`LOG_DEDUPE_SECONDS`) et au plus 10 lignes par minute (`LOG_MAX_PER_MINUTE`). Le nombre de lignes ignorées est indiqué.
 Pour changer les motifs, copie le fichier d'exemple dans le dossier d'état :
 
 ```bash
@@ -146,7 +146,7 @@ echo 'LOG_PATTERNS_FILE=/app/state/patterns.json' >> ~/warden-icarus/.env
 cd ~/warden-icarus && docker compose up -d
 ```
 
-Chaque catégorie présente dans le fichier remplace celle par défaut. Pour `join`/`leave`, le groupe nommé `(?P<name>…)` capture le nom du joueur.
+Chaque catégorie présente dans le fichier remplace celle par défaut (si tu définis `ignore`, garde les motifs de l'exemple et ajoute les tiens ; sans clé `ignore`, les motifs par défaut s'appliquent). Pour `join`/`leave`, le groupe nommé `(?P<name>…)` capture le nom du joueur.
 
 ### Sécurité
 - Le socket Docker **équivaut à root sur la VM**. Le bot ne l'utilise qu'à travers `warden/docker_ctl.py`, qui n'agit que sur le conteneur nommé `icarus` et seulement pour lire son état, ses statistiques, ses logs et ses événements, le démarrer, l'arrêter, le redémarrer ou le recréer. Pour une recréation, le bot vérifie que le projet compose se trouve bien dans `/home/lucky/icarus`. Pas d'`exec`, pas d'autre conteneur. Cette limite est assurée par le code, pas par Docker : protège le token Discord et l'accès à la VM en conséquence.
