@@ -1,14 +1,17 @@
-"""Classification des événements Docker du conteneur Icarus.
+"""Classification of the Icarus container's Docker events.
 
-Cas à distinguer :
-- actions lancées par le bot (Discord ou planificateur) : attendues, pas d'alerte ;
-- arrêt propre (code 0) sans demande extérieure : cycle normal de l'image quand le serveur
-  est vide (SHUTDOWN_EMPTY_FOR / SHUTDOWN_NOT_JOINED_FOR), relancé par `restart:
-  unless-stopped` — ni alerte ni message ;
-- sortie en erreur (code ≠ 0) ou OOM sans demande : **crash** ;
-- relance par Docker après un crash : **redémarrage après crash** ;
-- `docker restart` hors Discord : **redémarrage inattendu** ;
-- `docker stop`/`kill`/`start` hors Discord : simple information.
+Cases to tell apart:
+- actions started by the bot (Discord or scheduler): expected, no alert;
+- clean stop (code 0) with no outside request: a normal stop of the container (with the old
+  image, the empty-server shutdown), restarted by `restart: unless-stopped`: no alert, no
+  message;
+- exit with an error (code != 0) or OOM with no request: **crash**;
+- restart by Docker after a crash: **restart after crash**;
+- `docker restart` outside Discord: **unexpected restart**;
+- `docker stop`/`kill`/`start` outside Discord: plain information.
+
+With mornedhels/icarus-server, a game crash is restarted by supervisord inside the
+container and produces no Docker event: it shows up in the logs instead (logpatterns).
 """
 
 from __future__ import annotations
@@ -17,10 +20,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-KILL_WINDOW = 120.0  # une sortie moins de 2 min après un kill/stop extérieur = arrêt demandé
-RECENT_DIE = 900.0  # une relance moins de 15 min après une sortie y est rattachée
+KILL_WINDOW = 120.0  # an exit less than 2 min after an outside kill/stop = requested stop
+RECENT_DIE = 900.0  # a restart less than 15 min after an exit is linked to it
 OOM_WINDOW = 30.0
-BOT_GRACE = 30.0  # événements tardifs après la fin d'une action du bot
+BOT_GRACE = 30.0  # late events after the end of a bot action
 
 CRASH = "crash"
 RESTART_AFTER_CRASH = "restart_after_crash"
@@ -61,7 +64,7 @@ class EventClassifier:
         self._crash_restart_reported = False
         self._manual_reported_at: float | None = None
 
-    # --- actions du bot ---
+    # --- bot actions ---
     def begin_operation(self, name: str) -> None:
         self._operation = name
         self._operation_ended_at = None
@@ -133,7 +136,7 @@ class EventClassifier:
                 if die.kind in ("clean", "bot"):
                     return None
                 if die.kind == "manual" and now - die.at < KILL_WINDOW:
-                    # docker restart : kill → die → stop → start → restart
+                    # docker restart: kill -> die -> stop -> start -> restart
                     return Classified(UNEXPECTED_RESTART, action) if action == "restart" else None
             return Classified(UNEXPECTED_RESTART if action == "restart" else EXTERNAL_START, action)
 

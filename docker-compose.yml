@@ -4,17 +4,17 @@ services:
     image: warden-icarus:latest
     container_name: warden-icarus
     restart: unless-stopped
-    # Réseau de l'hôte : A2S interroge 127.0.0.1:32784 (port query d'Icarus publié sur la VM).
+    # Host network: A2S queries 127.0.0.1:32784 (Icarus query port published on the VM).
     network_mode: host
-    # Pas root : uid/gid 1000 (lucky, propriétaire de /home/lucky/icarus) + groupe docker de l'hôte.
+    # Not root: uid/gid 1000 (lucky, owner of /home/lucky/icarus) + the host's docker group.
     user: "${PUID:-1000}:${PGID:-1000}"
     group_add:
       - "${DOCKER_GID:?DOCKER_GID manquant dans .env (getent group docker | cut -d: -f3)}"
     env_file: .env
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      # Dossier Icarus monté au MÊME chemin : docker compose (lancé par le bot pour recréer le
-      # conteneur) résout ainsi ./data et ./game vers les bons chemins de l'hôte.
+      # Icarus folder mounted at the SAME path: docker compose (run by the bot to recreate the
+      # container) then resolves ./data and ./game to the right host paths.
       - ${ICARUS_DIR:-/home/lucky/icarus}:${ICARUS_DIR:-/home/lucky/icarus}
       - ./state:/app/state
     read_only: true

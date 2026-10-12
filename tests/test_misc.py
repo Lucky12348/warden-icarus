@@ -1,4 +1,4 @@
-"""Fonctions pures annexes : logs, Docker (calculs), configuration, état, jetons."""
+"""Pure helper functions: logs, Docker (computations), configuration, state, tokens."""
 
 import json
 from datetime import timezone
@@ -65,22 +65,38 @@ def test_cpu_and_memory():
 
 
 def test_read_buildid(tmp_path):
-    steamapps = tmp_path / "steamapps"
-    steamapps.mkdir()
+    # mornedhels image: game in /opt/icarus/server -> game/server on the host.
+    steamapps = tmp_path / "server" / "steamapps"
+    steamapps.mkdir(parents=True)
     (steamapps / "appmanifest_2089300.acf").write_text('"AppState"\n{\n\t"buildid"\t\t"16843211"\n}\n')
+    (tmp_path / "current_version").write_text("16000000\n")
     assert read_buildid(tmp_path) == "16843211"
     assert read_buildid(tmp_path / "missing") is None
 
 
+def test_read_buildid_falls_back_to_current_version(tmp_path):
+    (tmp_path / "current_version").write_text("16843211\n")
+    assert read_buildid(tmp_path) == "16843211"
+    (tmp_path / "current_version").write_text("null\n")
+    assert read_buildid(tmp_path) is None
+
+
 def test_config_defaults_and_minimum_stop_timeout():
+    assert Config.from_env(BASE_ENV).stop_timeout == 90  # supervisord's stopwaitsecs
     cfg = Config.from_env({**BASE_ENV, "STOP_TIMEOUT": "10"})
     assert cfg.stop_timeout == MIN_STOP_TIMEOUT
+    assert str(cfg.server_settings_file).replace("\\", "/") == (
+        "/home/lucky/icarus/data/Saved/Config/WindowsServer/ServerSettings.ini"
+    )
     assert str(cfg.prospects_dir).replace("\\", "/").endswith(
         "icarus/data/Saved/PlayerData/DedicatedServer/Prospects"
     )
     assert str(cfg.backup_dir).replace("\\", "/") == "/home/lucky/icarus/backups"
     assert cfg.ntfy_topic == "icarus" and not cfg.ntfy_enabled
     assert cfg.clean_exit_codes == frozenset({0})
+    assert not cfg.error_logs_to_discord and not cfg.log_spam_summary
+    cfg = Config.from_env({**BASE_ENV, "ERROR_LOGS_TO_DISCORD": "true", "LOG_SPAM_SUMMARY": "true"})
+    assert cfg.error_logs_to_discord and cfg.log_spam_summary
 
 
 def test_config_errors():
@@ -95,13 +111,24 @@ def test_config_errors():
 def test_state_persistence(tmp_path):
     path = tmp_path / "state.json"
     state = State(path)
-    assert state.scheduled_restart_enabled and state.scheduled_restart_time == "06:00"
+    # Off by default: the image already updates the game itself.
+    assert not state.scheduled_restart_enabled and state.scheduled_restart_time == "06:00"
     assert state.toggle_alert("crash") is False
     state.set_panel_message("panel", 10, 20)
     reloaded = State(path)
     assert reloaded.alert_enabled("crash") is False
     assert reloaded.panel_message("panel") == (10, 20)
     assert reloaded.alert_enabled("ntfy") is True
+
+
+def test_state_migration_disables_scheduled_restart_once(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"scheduled_restart": {"enabled": True, "time": "05:30"}, "last_buildid": "1"}))
+    state = State(path)
+    assert not state.scheduled_restart_enabled and state.scheduled_restart_time == "05:30"
+    assert json.loads(path.read_text())["schema"] == 2  # migration saved
+    assert state.toggle_scheduled_restart() is True
+    assert State(path).scheduled_restart_enabled  # a choice made after the migration is kept
 
 
 def test_pending_tokens_are_per_user_and_expire():
@@ -115,3 +142,24 @@ def test_pending_tokens_are_per_user_and_expire():
     token = pending.put(42, x=1)
     now[0] += 901
     assert pending.get(token, 42) is None
+
+
+def test_settings_panel_warns_about_scheduled_restart_and_marks_ini_settings():
+    from warden.panels import SCHEDULED_RESTART_WARNING, SettingsInfo, settings_panel
+
+    info = SettingsInfo(
+        alerts={}, ntfy_configured=False, scheduled_enabled=False, scheduled_time="06:00", tz_name="Europe/Paris",
+        env_values={"SERVERNAME": "ZEHEFLAND", "SAVEGAMEONEXIT": "True"},
+        editable={"SERVERNAME", "SAVEGAMEONEXIT"}, pending=set(), env_readable=True, ini_readable=False,
+    )
+    text = "\n".join(b for b in settings_panel(info).blocks if isinstance(b, str))
+    assert SCHEDULED_RESTART_WARNING in text and "UPDATE_CRON" in text
+    assert "**Sauvegarde à l'arrêt** : ✅ Oui 📄" in text
+    assert "ServerSettings.ini` introuvable" in text
+
+
+def test_state_with_unreadable_schema_is_kept(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"schema": "x", "panel_messages": {"panel": [1, 2]}}))
+    state = State(path)
+    assert state.panel_message("panel") == (1, 2)  # the whole state is not reset

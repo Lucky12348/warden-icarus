@@ -1,4 +1,4 @@
-"""Point d'entrée : `python -m warden`."""
+"""Entry point: `python -m warden`."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def main() -> int:
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
                 loop.add_signal_handler(sig, lambda: asyncio.create_task(bot.close()))
-            except NotImplementedError:  # Windows (développement)
+            except NotImplementedError:  # Windows (development)
                 pass
         async with bot:
             await bot.start(config.discord_token)

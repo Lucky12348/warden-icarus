@@ -7,14 +7,27 @@ from warden import settings_store as ss
 COMPOSE = """
 services:
   icarus:
+    image: mornedhels/icarus-server:latest
     environment:
-      - SERVERNAME=${SERVERNAME}
-      - JOIN_PASSWORD=${JOIN_PASSWORD}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
-      - MAX_PLAYERS=${MAX_PLAYERS:-8}
-      - SHUTDOWN_EMPTY_FOR=300
-      - STEAM_USERID=1000
+      - SERVER_NAME=${SERVERNAME}
+      - SERVER_PASSWORD=${JOIN_PASSWORD}
+      - SERVER_ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - SERVER_MAX_PLAYERS=${MAX_PLAYERS:-8}
+      - SERVER_SHUTDOWN_IF_EMPTY=300
+      - PUID=1000
 """
+
+INI = (
+    "[/Script/Icarus.DedicatedServerSettings]\n"
+    "SessionName=ZEHEFLAND\n"
+    "JoinPassword=secret\n"
+    "SaveGameOnExit=True\n"
+    "GameSaveFrequency=10\n"
+    "LastProspectName=Olympus\n"
+    "\n"
+    "[/Script/Autre.Section]\n"
+    "SaveGameOnExit=ne pas toucher\n"
+)
 
 
 def test_parse_env_formats():
@@ -45,7 +58,7 @@ def test_parse_env_formats():
         ("ZEHEFLAND", "ZEHEFLAND"),
         ("", ""),
         ("Mon serveur", "'Mon serveur'"),
-        ("pa$$word", "'pa$$word'"),  # quotes simples : pas d'interpolation par compose
+        ("pa$$word", "'pa$$word'"),  # single quotes: no interpolation by compose
         ("l'île", '"l\'île"'),
     ],
 )
@@ -116,7 +129,7 @@ def test_validate_strings_and_secrets():
         ss.validate(name, "x" * 65)
 
     secret = ss.SETTINGS_BY_KEY["JOIN_PASSWORD"]
-    assert ss.validate(secret, " espace ") == " espace "  # un mot de passe n'est pas « nettoyé »
+    assert ss.validate(secret, " espace ") == " espace "  # a password is not "cleaned"
     assert ss.validate(secret, "") == ""
 
 
@@ -131,10 +144,95 @@ def test_secrets_never_displayed():
 def test_editable_keys_follow_compose_references():
     keys = ss.editable_keys(COMPOSE)
     assert {"SERVERNAME", "JOIN_PASSWORD", "ADMIN_PASSWORD", "MAX_PLAYERS"} <= keys
-    assert "SHUTDOWN_EMPTY_FOR" not in keys  # en dur dans le compose
+    assert "SHUTDOWN_EMPTY_FOR" not in keys  # hard-coded in the compose file
 
 
-def test_pending_keys_compare_with_container_env():
-    env_values = {"SERVERNAME": "Nouveau", "MAX_PLAYERS": "8", "JOIN_PASSWORD": "x"}
-    running = ss.container_env(["SERVERNAME=Ancien", "MAX_PLAYERS=8", "JOIN_PASSWORD=x", "PATH=/usr/bin"])
-    assert ss.pending_keys(env_values, running, ["SERVERNAME", "MAX_PLAYERS", "JOIN_PASSWORD"]) == {"SERVERNAME"}
+def test_ini_settings_are_always_editable():
+    keys = ss.editable_keys(COMPOSE)
+    assert {"SAVEGAMEONEXIT", "GAMESAVEFREQUENCY", "FIBERFOLIAGERESPAWN", "LARGESTONERESPAWN"} <= keys
+    assert all(ss.SETTINGS_BY_KEY[k].storage == "ini" for k in ("SAVEGAMEONEXIT", "LARGESTONERESPAWN"))
+    assert ss.SETTINGS_BY_KEY["LARGESTONERESPAWN"].ini_key == "LargeStonesRespawn"
+
+
+def test_pending_keys_compare_with_translated_container_env():
+    env_values = {"SERVERNAME": "Nouveau", "MAX_PLAYERS": "8", "JOIN_PASSWORD": "x", "SAVEGAMEONEXIT": "True"}
+    running = ss.container_env(["SERVER_NAME=Ancien", "SERVER_MAX_PLAYERS=8", "SERVER_PASSWORD=x", "PATH=/usr/bin"])
+    keys = ["SERVERNAME", "MAX_PLAYERS", "JOIN_PASSWORD", "SAVEGAMEONEXIT"]
+    # SAVEGAMEONEXIT (left over from an old .env) is no longer a variable: never "pending".
+    assert ss.pending_keys(env_values, running, keys) == {"SERVERNAME"}
+
+
+def test_parse_ini_section_ignores_other_sections():
+    values = ss.parse_ini_section(INI)
+    assert values["SaveGameOnExit"] == "True" and values["GameSaveFrequency"] == "10"
+    assert ss.ini_lookup(values, "savegameonexit") == "True"
+    assert ss.ini_lookup(values, "FiberFoliageRespawn") is None
+
+
+def test_update_ini_replaces_in_place_and_appends_missing_keys():
+    out = ss.update_ini_text(INI, {"SaveGameOnExit": "False", "LargeStonesRespawn": "True"})
+    assert out == (
+        "[/Script/Icarus.DedicatedServerSettings]\n"
+        "SessionName=ZEHEFLAND\n"
+        "JoinPassword=secret\n"
+        "SaveGameOnExit=False\n"
+        "GameSaveFrequency=10\n"
+        "LastProspectName=Olympus\n"
+        "LargeStonesRespawn=True\n"
+        "\n"
+        "[/Script/Autre.Section]\n"
+        "SaveGameOnExit=ne pas toucher\n"
+    )
+
+
+def test_update_ini_is_case_insensitive_and_keeps_crlf():
+    text = "[/Script/Icarus.DedicatedServerSettings]\r\nsavegameonexit=True\r\n"
+    out = ss.update_ini_text(text, {"SaveGameOnExit": "False"})
+    assert out == "[/Script/Icarus.DedicatedServerSettings]\r\nsavegameonexit=False\r\n"
+
+
+def test_update_ini_creates_missing_section():
+    out = ss.update_ini_text("[Autre]\nA=1\n", {"GameSaveFrequency": "5"})
+    assert out == "[Autre]\nA=1\n\n[/Script/Icarus.DedicatedServerSettings]\nGameSaveFrequency=5\n"
+    with pytest.raises(ss.SettingError):
+        ss.update_ini_text(INI, {"SessionName": "a\nb"})
+
+
+def test_write_ini_creates_backup(tmp_path):
+    path = tmp_path / "ServerSettings.ini"
+    path.write_bytes(INI.encode("utf-8"))
+    backup = ss.write_ini(path, {"GameSaveFrequency": "15"})
+    assert backup.name == "ServerSettings.ini.bak" and backup.read_bytes() == INI.encode("utf-8")
+    values = ss.read_ini(path)
+    assert values["GameSaveFrequency"] == "15" and values["LastProspectName"] == "Olympus"
+    assert b"\r" not in path.read_bytes()  # original line endings kept
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_write_ini_keeps_utf16_encoding(tmp_path):
+    path = tmp_path / "ServerSettings.ini"
+    path.write_bytes(INI.replace("\n", "\r\n").encode("utf-16"))
+    ss.write_ini(path, {"FiberFoliageRespawn": "False"})
+    raw = path.read_bytes()
+    assert raw.startswith(b"\xff\xfe")
+    text = raw.decode("utf-16")
+    assert "FiberFoliageRespawn=False\r\n" in text and "\r\r" not in text
+
+
+def test_write_ini_requires_existing_file(tmp_path):
+    with pytest.raises(ss.SettingError, match="introuvable"):
+        ss.write_ini(tmp_path / "ServerSettings.ini", {"SaveGameOnExit": "True"})
+
+
+def test_current_values_read_each_storage():
+    env = {"SERVERNAME": "ZEHEFLAND", "SAVEGAMEONEXIT": "False"}  # old variable ignored
+    values = ss.current_values(env, ss.parse_ini_section(INI))
+    assert values["SERVERNAME"] == "ZEHEFLAND"
+    assert values["SAVEGAMEONEXIT"] == "True"  # read from the .ini
+    assert "FIBERFOLIAGERESPAWN" not in values
+
+
+def test_update_ini_replaces_every_duplicate_key():
+    text = "[/Script/Icarus.DedicatedServerSettings]\nSaveGameOnExit=True\nSaveGameOnExit=True\n"
+    out = ss.update_ini_text(text, {"SaveGameOnExit": "False"})
+    assert out == "[/Script/Icarus.DedicatedServerSettings]\nSaveGameOnExit=False\nSaveGameOnExit=False\n"

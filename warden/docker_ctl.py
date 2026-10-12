@@ -1,12 +1,13 @@
-"""Accès Docker restreint au seul conteneur Icarus.
+"""Docker access restricted to the Icarus container only.
 
-Le socket Docker équivaut à un accès root sur la VM. Ce module est le **seul** endroit du
-bot qui l'utilise, et il n'expose qu'une liste fermée d'opérations sur un conteneur nommé :
-état, statistiques, logs, événements, start/stop/restart, et recréation via le compose
-d'Icarus (dossier vérifié). Pas d'exec, pas de création de conteneur arbitraire, pas
-d'accès aux autres conteneurs.
+The Docker socket is equivalent to root access on the VM. This module is the **only** place
+in the bot that uses it, and it exposes only a closed list of operations on one named
+container: state, statistics, logs, events, start/stop/restart, recreation through the Icarus
+compose project (folder checked) and a single exec with a fixed command (FORCE_UPDATE_CMD,
+no parameter). No other exec, no arbitrary container creation, no access to other
+containers.
 
-Toutes les méthodes sont bloquantes : le bot les appelle via `asyncio.to_thread`.
+All methods are blocking: the bot calls them through `asyncio.to_thread`.
 """
 
 from __future__ import annotations
@@ -18,11 +19,19 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
+
+from . import safefs
 
 log = logging.getLogger(__name__)
 
 _COMPOSE_ENV_PASSTHROUGH = ("PATH", "DOCKER_HOST", "DOCKER_CONFIG", "HOME")
+
+# The only command ever run inside the container (single exception to "no exec"):
+# the image deletes the installed version, then restarts its updater program.
+FORCE_UPDATE_CMD = ("supervisorctl", "start", "icarus-force-update")
+
+MAX_LOG_LINE = 16 * 1024  # bytes kept per log line
 
 
 class DockerError(Exception):
@@ -57,7 +66,7 @@ class Stats:
 
 
 def parse_docker_time(value: str | None) -> datetime | None:
-    """« 2026-10-02T06:00:03.123456789Z » → datetime UTC (None pour la date zéro de Docker)."""
+    """"2026-10-02T06:00:03.123456789Z" -> UTC datetime (None for Docker's zero date)."""
     if not value or value.startswith("0001-01-01"):
         return None
     m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})?$", value)
@@ -87,7 +96,7 @@ def compute_cpu_percent(stats: dict[str, Any]) -> float | None:
 
 
 def compute_memory(stats: dict[str, Any]) -> tuple[int | None, int | None]:
-    """Mémoire utilisée hors cache (même calcul que `docker stats`), et limite."""
+    """Memory used excluding cache (same computation as `docker stats`), and limit."""
     mem = stats.get("memory_stats") or {}
     usage, limit = mem.get("usage"), mem.get("limit")
     if usage is None:
@@ -111,12 +120,12 @@ class IcarusDocker:
         self.name = container_name
         self.icarus_dir = icarus_dir
         if client is None:
-            import docker  # import local : les tests n'ont pas besoin du SDK
+            import docker  # local import: tests do not need the SDK
 
             client = docker.from_env()
         self.client = client
 
-    # --- lecture ---
+    # --- reading ---
     def _container(self) -> Any:
         import docker.errors
 
@@ -124,7 +133,7 @@ class IcarusDocker:
             container = self.client.containers.get(self.name)
         except docker.errors.NotFound:
             raise DockerError(f"Conteneur « {self.name} » introuvable") from None
-        if container.name != self.name:  # ne jamais agir sur un autre conteneur (préfixe d'ID…)
+        if container.name != self.name:  # never act on another container (ID prefix...)
             raise DockerError(f"Résolution inattendue : {container.name} au lieu de {self.name}")
         return container
 
@@ -160,19 +169,27 @@ class IcarusDocker:
         return Stats(compute_cpu_percent(raw), used, limit)
 
     def logs(self, since: int) -> Iterator[str]:
-        """Suit les logs (bloquant) à partir de `since` ; se termine à l'arrêt du conteneur."""
+        """Follow the logs (blocking) from `since`; ends when the container stops."""
         container = self._container()
         buffer = b""
         for chunk in container.logs(stream=True, follow=True, since=since, stdout=True, stderr=True):
             buffer += chunk
             *lines, buffer = buffer.split(b"\n")
+            if len(buffer) > MAX_LOG_LINE:  # line without end: emit it cut rather than grow forever
+                lines.append(buffer[:MAX_LOG_LINE])
+                buffer = b""
             for line in lines:
-                yield line.decode("utf-8", errors="replace").rstrip("\r")
+                yield line[:MAX_LOG_LINE].decode("utf-8", errors="replace").rstrip("\r")
         if buffer:
             yield buffer.decode("utf-8", errors="replace")
 
+    def tail(self, count: int) -> list[str]:
+        """The last `count` log lines (read-only, no follow)."""
+        raw = self._container().logs(stdout=True, stderr=True, stream=False, follow=False, tail=max(1, count))
+        return [line[:MAX_LOG_LINE] for line in raw.decode("utf-8", errors="replace").splitlines()]
+
     def events(self) -> Iterator[dict[str, Any]]:
-        """Événements Docker du seul conteneur Icarus (bloquant, infini)."""
+        """Docker events of the Icarus container only (blocking, endless)."""
         stream = self.client.events(decode=True, filters={"type": "container", "container": self.name})
         try:
             for event in stream:
@@ -194,10 +211,18 @@ class IcarusDocker:
     def restart(self, timeout: int) -> None:
         self._container().restart(timeout=timeout)
 
-    def compose_target(self) -> tuple[str, str, list[str], str]:
-        """(projet, dossier, fichiers compose, service) d'après les labels du conteneur.
+    def force_update(self) -> str:
+        """`supervisorctl start icarus-force-update` inside the container. Return the output."""
+        result = self._container().exec_run(list(FORCE_UPDATE_CMD), stdout=True, stderr=True)
+        output = (result.output or b"").decode("utf-8", errors="replace").strip()
+        if result.exit_code != 0:
+            raise DockerError(f"supervisorctl a échoué (code {result.exit_code}) : {output[-300:] or 'aucune sortie'}")
+        return output
 
-        Refuse toute recréation si le projet compose n'est pas dans ICARUS_DIR.
+    def compose_target(self) -> tuple[str, str, list[str], str]:
+        """(project, folder, compose files, service) from the container labels.
+
+        Refuse any recreation if the compose project is not in ICARUS_DIR.
         """
         labels = self._container().labels
         project = labels.get("com.docker.compose.project")
@@ -221,23 +246,28 @@ class IcarusDocker:
         for f in files:
             cmd += ["-f", f]
         cmd += args
-        # Environnement minimal : une variable du bot ne doit pas écraser une valeur du .env d'Icarus.
+        # Minimal environment: a bot variable must not override a value from the Icarus .env.
         env = {k: os.environ[k] for k in _COMPOSE_ENV_PASSTHROUGH if k in os.environ}
         log.info("Exécution : %s", " ".join(cmd))
         return subprocess.run(cmd, cwd=workdir, env=env, capture_output=True, text=True, timeout=timeout, check=False)
 
     def compose_check(self) -> None:
-        """Valide le compose + .env (syntaxe, interpolation) sans rien modifier."""
+        """Validate compose + .env (syntax, interpolation) without changing anything."""
         result = self._compose(["config", "--quiet"], timeout=60)
         if result.returncode != 0:
             raise DockerError(f"docker compose config a échoué : {(result.stderr or result.stdout).strip()[-500:]}")
 
-    def recreate(self, stop_timeout: int, timeout: int) -> None:
-        """Recrée le conteneur avec la configuration actuelle du compose et du .env."""
+    def recreate(self, stop_timeout: int, timeout: int, before_up: Callable[[], None] | None = None) -> None:
+        """Recreate the container with the current compose and .env configuration.
+
+        `before_up` is called with the server stopped, right before `docker compose up`.
+        """
         _, _, _, service = self.compose_target()
         status = self.status()
         if status.running:
-            self.stop(stop_timeout)  # arrêt propre avec le délai du bot (sauvegarde du jeu)
+            self.stop(stop_timeout)  # clean stop with the bot's timeout (game save)
+        if before_up is not None:
+            before_up()
         result = self._compose(
             ["up", "-d", "--no-deps", "--force-recreate", "--timeout", str(stop_timeout), service],
             timeout=timeout,
@@ -247,11 +277,25 @@ class IcarusDocker:
 
 
 def read_buildid(game_dir: Path, app_id: str = "2089300") -> str | None:
-    """Build Steam installé (appmanifest), pour détecter les mises à jour au démarrage."""
-    manifest = game_dir / "steamapps" / f"appmanifest_{app_id}.acf"
+    """Installed Steam build, to detect updates.
+
+    The image installs the game in /opt/icarus/server (game/server on the host): steamcmd's
+    appmanifest first, then the `current_version` file kept by the image's updater.
+    """
+    for manifest in (
+        game_dir / "server" / "steamapps" / f"appmanifest_{app_id}.acf",
+        game_dir / "steamapps" / f"appmanifest_{app_id}.acf",  # old image (nerodon)
+    ):
+        try:
+            text = safefs.read_bytes(manifest, safefs.SMALL_FILE)[0].decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        m = re.search(r'"buildid"\s+"(\d+)"', text)
+        if m:
+            return m.group(1)
     try:
-        text = manifest.read_text(encoding="utf-8", errors="replace")
+        raw = safefs.read_bytes(game_dir / "current_version", safefs.SMALL_FILE)[0]
     except OSError:
         return None
-    m = re.search(r'"buildid"\s+"(\d+)"', text)
-    return m.group(1) if m else None
+    version = raw.decode("utf-8", errors="replace").strip()
+    return version if version.isdigit() else None

@@ -1,7 +1,7 @@
-"""Requêtes A2S (Steam query) et détection des arrivées/départs de joueurs par différence.
+"""A2S queries (Steam query) and detection of player arrivals/departures by difference.
 
-Icarus peut ne renvoyer que le nombre de joueurs, sans les noms : dans ce cas on affiche
-« 2/8 joueurs » sans liste et on annonce « un joueur a rejoint » sans nom.
+Icarus may return only the number of players, without names: in that case the panel shows
+"2/8 joueurs" without a list and announces "un joueur a rejoint" without a name.
 """
 
 from __future__ import annotations
@@ -9,6 +9,8 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from dataclasses import dataclass
+
+from .ui import md
 
 log = logging.getLogger(__name__)
 
@@ -18,7 +20,7 @@ class Snapshot:
     server_name: str
     count: int
     max_players: int
-    names: tuple[str, ...] | None  # None : noms indisponibles
+    names: tuple[str, ...] | None  # None: names unavailable
 
     @property
     def summary(self) -> str:
@@ -27,7 +29,7 @@ class Snapshot:
 
 
 def build_snapshot(server_name: str, count: int, max_players: int, raw_names: list[str] | None) -> Snapshot:
-    """Les noms ne sont retenus que s'ils sont tous renseignés et cohérents avec le nombre."""
+    """Names are kept only if all are filled in and consistent with the count."""
     names: tuple[str, ...] | None = None
     if raw_names is not None:
         cleaned = [n.strip() for n in raw_names]
@@ -37,13 +39,13 @@ def build_snapshot(server_name: str, count: int, max_players: int, raw_names: li
 
 
 async def query(host: str, port: int, timeout: float = 3.0) -> Snapshot | None:
-    """Interroge le serveur ; None s'il ne répond pas (arrêté, en démarrage, mise à jour…)."""
-    import a2s  # import local : les tests des fonctions pures n'en ont pas besoin
+    """Query the server; None if it does not answer (stopped, starting, updating...)."""
+    import a2s  # local import: tests of the pure functions do not need it
 
     address = (host, port)
     try:
         info = await a2s.ainfo(address, timeout=timeout)
-    except Exception as e:  # noqa: BLE001 - timeout, réponse invalide, port fermé…
+    except Exception as e:  # noqa: BLE001 - timeout, invalid answer, closed port...
         log.debug("A2S info sans réponse : %s", e)
         return None
     raw_names: list[str] | None
@@ -61,10 +63,10 @@ def _plural(n: int, singular: str, plural: str) -> str:
 
 
 def diff(previous: Snapshot | None, current: Snapshot | None) -> list[tuple[str, str]]:
-    """Événements (« join »/« leave », texte) entre deux relevés réussis.
+    """Events ("join"/"leave", text) between two successful snapshots.
 
-    Un relevé manquant (A2S sans réponse) ne produit rien : on évite d'annoncer à tort que
-    tout le monde est parti quand le serveur ne répond simplement plus.
+    A missing snapshot (A2S not answering) produces nothing: this avoids wrongly announcing
+    that everyone left when the server simply stops answering.
     """
     if previous is None or current is None:
         return []
@@ -73,9 +75,9 @@ def diff(previous: Snapshot | None, current: Snapshot | None) -> list[tuple[str,
     if previous.names is not None and current.names is not None:
         before, after = Counter(previous.names), Counter(current.names)
         for name in sorted((after - before).elements(), key=str.lower):
-            events.append(("join", f"👋 **{name}** a rejoint la partie{suffix}"))
+            events.append(("join", f"👋 **{md(name)}** a rejoint la partie{suffix}"))
         for name in sorted((before - after).elements(), key=str.lower):
-            events.append(("leave", f"🚪 **{name}** a quitté la partie{suffix}"))
+            events.append(("leave", f"🚪 **{md(name)}** a quitté la partie{suffix}"))
         return events
 
     delta = current.count - previous.count
@@ -93,5 +95,5 @@ def players_line(snapshot: Snapshot | None) -> str:
         return "👥 Joueurs : — *(le serveur ne répond pas aux requêtes)*"
     line = f"👥 **{snapshot.summary}**"
     if snapshot.names:
-        line += " : " + ", ".join(snapshot.names)
+        line += " : " + ", ".join(md(n) for n in snapshot.names)
     return line

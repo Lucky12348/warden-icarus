@@ -1,14 +1,14 @@
-"""Sauvegardes des parties Icarus (prospects).
+"""Backups of Icarus saves (prospects).
 
-- Parties actives : `Prospects/<nom>.json`.
-- Sauvegardes du jeu : `<nom>.json.backup_N` (créées par Icarus).
-- Copies de sécurité de restauration : `<nom>.json.pre_restore_<AAAAMMJJ-HHMMSS>` (même format
-  que l'ancien bot, pour que celles déjà présentes restent reconnues).
-- Archives du bot : `backups/icarus-<AAAAMMJJ-HHMMSS>.tar.gz` contenant tout `Saved/PlayerData`
-  (sans les .backup/.pre_restore), accompagnées d'un `.manifest.json` listant les parties.
+- Active saves: `Prospects/<name>.json`.
+- Game backups: `<name>.json.backup_N` (created by Icarus).
+- Restore safety copies: `<name>.json.pre_restore_<YYYYMMDD-HHMMSS>` (same format as the
+  old bot, so existing ones are still recognised).
+- Bot archives: `backups/icarus-<YYYYMMDD-HHMMSS>.tar.gz` containing all of `Saved/PlayerData`
+  (without .backup/.pre_restore files), alongside a `.manifest.json` listing the saves.
 
-Ce module ne dépend ni de Discord ni de Docker : la restauration suppose que l'appelant a
-déjà arrêté le conteneur.
+This module depends on neither Discord nor Docker: restoring assumes the caller has already
+stopped the container.
 """
 
 from __future__ import annotations
@@ -17,17 +17,18 @@ import io
 import json
 import os
 import re
-import shutil
 import tarfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
 from pathlib import Path, PurePosixPath
 
+from . import safefs
+
 ARCHIVE_PREFIX = "icarus-"
 ARCHIVE_SUFFIX = ".tar.gz"
 MANIFEST_SUFFIX = ".manifest.json"
-_ARCHIVE_RE = re.compile(r"^icarus-\d{8}-\d{6}(?:-\d+)?\.tar\.gz$")
+_ARCHIVE_RE = re.compile(r"^icarus-(\d{8}-\d{6})(?:-(\d+))?\.tar\.gz$")
 _EXCLUDED_MARKERS = (".backup", ".pre_restore_", ".tmp")
 
 
@@ -45,15 +46,15 @@ class Prospect:
 
 @dataclass(frozen=True)
 class RestorePoint:
-    source: str  # "game" (fichier à côté de la partie) ou "archive"
-    ref: str  # nom du fichier .backup/.pre_restore, ou nom de l'archive
-    kind: str  # "backup", "pre_restore" ou "archive"
+    source: str  # "game" (file next to the save) or "archive"
+    ref: str  # name of the .backup/.pre_restore file, or of the archive
+    kind: str  # "backup", "pre_restore" or "archive"
     modified: datetime
     size: int
 
     @property
     def token(self) -> str:
-        """Valeur courte pour un menu Discord (100 caractères max)."""
+        """Short value for a Discord menu (100 characters max)."""
         return f"{'g' if self.source == 'game' else 'a'}:{self.ref}"
 
 
@@ -77,7 +78,7 @@ def _mtime(path: Path, tz: tzinfo | None) -> datetime:
 
 
 def check_name(name: str) -> str:
-    """Refuse tout ce qui pourrait sortir du dossier (valeur venant d'une interaction Discord)."""
+    """Reject anything that could escape the folder (value coming from a Discord interaction)."""
     if (
         not name
         or name in (".", "..")
@@ -99,17 +100,25 @@ def list_prospects(prospects_dir: Path, tz: tzinfo | None = None) -> list[Prospe
         return []
     out = []
     for path in prospects_dir.iterdir():
-        if path.is_file() and is_active_save(path.name):
+        if safefs.is_regular(path) and is_active_save(path.name):  # symlinks excluded
             st = path.stat()
             out.append(Prospect(path.name[: -len(".json")], path, datetime.fromtimestamp(st.st_mtime, tz), st.st_size))
     return sorted(out, key=lambda p: p.modified, reverse=True)
 
 
+def _archive_order(path: Path) -> tuple[str, int]:
+    """(timestamp, n): "...-120000-1" is newer than "...-120000" (same second)."""
+    m = _ARCHIVE_RE.match(path.name)
+    assert m is not None
+    return m.group(1), int(m.group(2) or 0)
+
+
 def list_archives(backup_dir: Path) -> list[Path]:
-    """Archives du bot, de la plus récente à la plus ancienne (le nom est horodaté)."""
+    """Bot archives, newest first (the name is timestamped)."""
     if not backup_dir.is_dir():
         return []
-    return sorted((p for p in backup_dir.iterdir() if p.is_file() and _ARCHIVE_RE.match(p.name)), reverse=True)
+    archives = (p for p in backup_dir.iterdir() if p.is_file() and _ARCHIVE_RE.match(p.name))
+    return sorted(archives, key=_archive_order, reverse=True)
 
 
 def _manifest_path(archive: Path) -> Path:
@@ -117,7 +126,7 @@ def _manifest_path(archive: Path) -> Path:
 
 
 def archive_prospects(archive: Path, prospects_rel: str) -> list[str]:
-    """Parties contenues dans une archive (manifeste si présent, sinon lecture de l'archive)."""
+    """Saves contained in an archive (manifest if present, otherwise read the archive)."""
     manifest = _manifest_path(archive)
     if manifest.exists():
         try:
@@ -147,7 +156,7 @@ def list_restore_points(
     points: list[RestorePoint] = []
     if prospects_dir.is_dir():
         for path in prospects_dir.iterdir():
-            if not path.is_file():
+            if not safefs.is_regular(path):
                 continue
             if path.name.startswith(f"{prospect}.json.backup"):
                 kind = "backup"
@@ -161,15 +170,15 @@ def list_restore_points(
             if prospect in archive_prospects(archive, prospects_rel):
                 points.append(RestorePoint("archive", archive.name, "archive", _mtime(archive, tz), archive.stat().st_size))
         except (OSError, tarfile.TarError):
-            continue  # archive corrompue : ignorée plutôt que de bloquer la liste
+            continue  # corrupt archive: skipped rather than blocking the list
     return sorted(points, key=lambda p: p.modified, reverse=True)
 
 
 def _read_valid_json(path: Path, attempts: int = 3, delay: float = 1.0) -> tuple[bytes, bool]:
-    """Lit un fichier JSON ; réessaie s'il est en cours d'écriture par le jeu."""
+    """Read a JSON file; retry if the game is still writing it."""
     data = b""
     for i in range(attempts):
-        data = path.read_bytes()
+        data = safefs.read_bytes(path, safefs.SAVE_FILE)[0]
         try:
             json.loads(data)
             return data, True
@@ -189,20 +198,37 @@ def _unique_archive_path(backup_dir: Path, now: datetime) -> Path:
     return path
 
 
+def _walk_regular_files(root: Path) -> list[Path]:
+    """Regular files under `root`, sorted, without following any symlink (file or folder)."""
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(dirpath)
+        dirnames[:] = [d for d in dirnames if not (base / d).is_symlink()]
+        out.extend(base / f for f in filenames if safefs.is_regular(base / f))
+    return sorted(out)
+
+
 def create_archive(
     saves_root: Path,
     backup_dir: Path,
     prospects_rel: str,
     now: datetime,
     json_retry_delay: float = 1.0,
+    root: Path | None = None,
 ) -> ArchiveResult:
-    """Archive `saves_root` (Saved/PlayerData) en tar.gz horodaté, sans les sauvegardes du jeu.
+    """Archive `saves_root` (Saved/PlayerData) as a timestamped tar.gz, without the game backups.
 
-    Possible serveur allumé : chaque .json est relu jusqu'à être un JSON valide, pour ne pas
-    archiver un fichier en cours d'écriture.
+    Works with the server running: each .json is re-read until it is valid JSON, so that a
+    file being written is not archived. No symlink is followed, and the real folder must stay
+    under `root` (data/) when given.
     """
     if not saves_root.is_dir():
         raise BackupError(f"Dossier des sauvegardes introuvable : {saves_root}")
+    if root is not None:
+        try:
+            safefs.ensure_inside(saves_root / "_", root)
+        except safefs.UnsafePathError as e:
+            raise BackupError(str(e)) from None
     backup_dir.mkdir(parents=True, exist_ok=True)
     final = _unique_archive_path(backup_dir, now)
     tmp = final.with_name(final.name + ".tmp")
@@ -210,8 +236,8 @@ def create_archive(
     files, prospects, warnings = 0, [], []
     try:
         with tarfile.open(tmp, "w:gz") as tar:
-            for path in sorted(saves_root.rglob("*")):
-                if not path.is_file() or any(m in path.name for m in _EXCLUDED_MARKERS):
+            for path in _walk_regular_files(saves_root):
+                if any(m in path.name for m in _EXCLUDED_MARKERS):
                     continue
                 arcname = path.relative_to(saves_root).as_posix()
                 if path.suffix == ".json":
@@ -238,7 +264,7 @@ def create_archive(
 
 
 def apply_retention(backup_dir: Path, keep: int) -> list[Path]:
-    """Supprime les archives au-delà des `keep` plus récentes. Retourne les archives supprimées."""
+    """Delete archives beyond the `keep` newest. Return the deleted archives."""
     if keep < 1:
         raise ValueError("keep doit être >= 1")
     removed = []
@@ -257,9 +283,12 @@ def _load_restore_data(
         if not (ref.startswith(f"{prospect}.json.backup") or ref.startswith(f"{prospect}.json.pre_restore_")):
             raise BackupError(f"{ref} n'est pas une sauvegarde de {prospect}")
         path = prospects_dir / ref
-        if not path.is_file():
+        if not os.path.lexists(path):
             raise BackupError(f"Sauvegarde introuvable : {ref}")
-        return path.read_bytes()
+        try:
+            return safefs.read_bytes(path, safefs.SAVE_FILE)[0]  # never through a link (folder writable by the game)
+        except safefs.UnsafePathError as e:
+            raise BackupError(str(e)) from None
     if source == "archive":
         if not _ARCHIVE_RE.match(ref):
             raise BackupError(f"Archive invalide : {ref}")
@@ -289,11 +318,14 @@ def restore_prospect(
     ref: str,
     prospects_rel: str,
     now: datetime,
+    root: Path | None = None,
 ) -> RestoreResult:
-    """Remplace `<prospect>.json` par la sauvegarde choisie.
+    """Replace `<prospect>.json` with the chosen backup.
 
-    L'actuelle est d'abord **copiée** en `.pre_restore_<date>`, et la sauvegarde source est
-    conservée (copie, pas déplacement). Le conteneur doit être arrêté par l'appelant.
+    The current file is first **copied** to `.pre_restore_<date>`, and the source backup is
+    kept (copy, not move). The caller must have stopped the container.
+    The saves folder is writable by the game: no read or write goes through a symlink, and
+    the real folder must stay under `root` (data/) when given.
     """
     check_name(prospect)
     data = _load_restore_data(prospects_dir, backup_dir, prospect, source, ref, prospects_rel)
@@ -304,18 +336,18 @@ def restore_prospect(
 
     prospects_dir.mkdir(parents=True, exist_ok=True)
     target = prospects_dir / f"{prospect}.json"
-    pre_restore = None
-    if target.exists():
-        pre_restore = target.with_name(f"{target.name}.pre_restore_{now.strftime('%Y%m%d-%H%M%S')}")
-        shutil.copy2(target, pre_restore)
-
-    tmp = target.with_name(f".{target.name}.restore.tmp")
     try:
-        tmp.write_bytes(data)
-        os.replace(tmp, target)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+        if root is not None:
+            safefs.ensure_inside(target, root)
+        mode = 0o644
+        pre_restore = None
+        if os.path.lexists(target):
+            current, mode = safefs.read_bytes(target, safefs.SAVE_FILE)
+            pre_restore = target.with_name(f"{target.name}.pre_restore_{now.strftime('%Y%m%d-%H%M%S')}")
+            safefs.atomic_write(pre_restore, current, mode)
+        safefs.atomic_write(target, data, mode)
+    except safefs.UnsafePathError as e:
+        raise BackupError(f"{e} — restauration annulée, rien n'a été modifié") from None
     return RestoreResult(target, pre_restore)
 
 

@@ -36,3 +36,14 @@ def test_players_line():
     assert players_line(snap(2)) == "👥 **2/8 joueurs**"
     assert players_line(snap(2, ["Alice", "Bob"])) == "👥 **2/8 joueurs** : Alice, Bob"
     assert "ne répond pas" in players_line(None)
+
+
+def test_player_names_cannot_inject_markdown():
+    from warden.players import Snapshot, diff, players_line
+
+    evil = "[Clique](https://evil.example)"
+    before = Snapshot("S", 0, 8, ())
+    after = Snapshot("S", 1, 8, (evil,))
+    (_, text), = diff(before, after)
+    assert r"\[Clique]" in text
+    assert r"\[Clique]" in players_line(after)

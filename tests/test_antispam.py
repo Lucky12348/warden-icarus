@@ -21,10 +21,10 @@ def test_dedupe_within_window():
     clock = Clock()
     spam = AntiSpam(max_events=100, dedupe_seconds=300, clock=clock)
     assert spam.allow("Error 1")
-    assert not spam.allow("Error 2")  # même ligne, chiffres près
+    assert not spam.allow("Error 2")  # same line, apart from digits
     clock.t += 299
     assert not spam.allow("Error 3")
-    clock.t += 2  # 301 s après la première
+    clock.t += 2  # 301 s after the first one
     assert spam.allow("Error 4")
     assert spam.pop_suppressed() == 2
     assert spam.pop_suppressed() == 0
@@ -62,3 +62,23 @@ def test_suppressed_lines_do_not_consume_quota():
 def test_invalid_config():
     with pytest.raises(ValueError):
         AntiSpam(max_events=0)
+
+
+def test_summary_gate_at_most_once_per_hour():
+    from warden.antispam import SummaryGate
+
+    clock = Clock()
+    gate = SummaryGate(3600, clock=clock)
+    assert gate.pop_due() == 0
+    gate.add(5)
+    assert gate.pop_due() == 0  # not before one hour after start-up
+    clock.t += 3600
+    gate.add(2)
+    assert gate.pop_due() == 7
+    gate.add(1)
+    clock.t += 1800
+    assert gate.pop_due() == 0  # accumulated until the next summary
+    clock.t += 1800
+    assert gate.pop_due() == 1
+    clock.t += 7200
+    assert gate.pop_due() == 0  # nothing to summarise: no message

@@ -33,7 +33,7 @@ def test_list_prospects_ignores_backups(layout):
     write_json(prospects / "Olympus.json.backup_1", {"v": 0})
     write_json(prospects / "Olympus.json.pre_restore_20260101-060000", {"v": 0})
     names = [p.name for p in bk.list_prospects(prospects)]
-    assert names == ["Styx", "Olympus"]  # plus récente d'abord
+    assert names == ["Styx", "Olympus"]  # newest first
 
 
 def test_create_archive_contents_and_manifest(layout):
@@ -49,7 +49,7 @@ def test_create_archive_contents_and_manifest(layout):
     assert result.prospects == ["Olympus"]
     with tarfile.open(result.path) as tar:
         names = sorted(tar.getnames())
-    assert names == ["123456/Characters.json", f"{REL}/Olympus.json"]  # sans .backup
+    assert names == ["123456/Characters.json", f"{REL}/Olympus.json"]  # without .backup
     manifest = json.loads((backup_dir / "icarus-20261002-060000.manifest.json").read_text())
     assert manifest["prospects"] == ["Olympus"]
     assert not list(backup_dir.glob("*.tmp"))
@@ -113,7 +113,7 @@ def test_restore_from_game_backup_keeps_source(layout):
     assert json.loads((prospects / "Olympus.json").read_text()) == {"v": "old"}
     assert result.pre_restore.name == "Olympus.json.pre_restore_20261002-073000"
     assert json.loads(result.pre_restore.read_text()) == {"v": "current"}
-    assert (prospects / "Olympus.json.backup_2").exists()  # copie, pas déplacement
+    assert (prospects / "Olympus.json.backup_2").exists()  # copy, not move
 
 
 def test_restore_from_archive(layout):

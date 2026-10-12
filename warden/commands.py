@@ -1,11 +1,14 @@
-"""Slash commands (filet de secours des panneaux) : lecture pour tous, actions réservées au rôle admin."""
+"""Slash commands (fallback for the panels): read-only for everyone, actions reserved to the admin role."""
 
 from __future__ import annotations
 
 import asyncio
+import io
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 import discord
+from discord import app_commands
 
 from . import handlers
 from .panels import stats_text
@@ -13,6 +16,18 @@ from .ui import Colors, respond, update
 
 if TYPE_CHECKING:
     from .bot import WardenBot
+
+LOGS_MAX_LINES = 2000
+MESSAGE_LIMIT = 2000  # characters in a Discord message
+
+
+def format_logs(lines: list[str]) -> str | None:
+    """Code block ready to send, or None if too long for a message (-> .txt file)."""
+    if not lines:
+        return "ℹ️ Aucune ligne de logs."
+    body = "\n".join(lines).replace("```", "'''")
+    text = f"```\n{body}\n```"
+    return text if len(text) <= MESSAGE_LIMIT else None
 
 
 def setup(bot: "WardenBot") -> None:
@@ -31,6 +46,7 @@ def setup(bot: "WardenBot") -> None:
             f"**Rôle <@&{bot.config.admin_role_id}>**\n"
             "`/demarrer` · `/arreter` · `/redemarrer` · `/maj` — mêmes actions que les boutons du panneau\n"
             "`/sauvegarde` — archive horodatée des parties\n"
+            "`/logs [lignes]` — dernières lignes de logs du serveur (réponse privée)\n"
             "`/panneaux` — republie / rafraîchit les panneaux\n"
             "Restauration et réglages : salons des panneaux sauvegardes et réglages.\n\n"
             + ("✅ Tu as le rôle admin." if admin else "ℹ️ Tu n'as pas le rôle admin : accès en lecture seule.")
@@ -61,13 +77,36 @@ def setup(bot: "WardenBot") -> None:
     async def redemarrer(interaction: discord.Interaction) -> None:
         await handlers.request_server_action(bot, interaction, "restart")
 
-    @tree.command(name="maj", description="Mettre à jour Icarus = redémarrer le conteneur (admin)", guild=guild)
+    @tree.command(name="maj", description="Forcer la mise à jour d'Icarus via l'image (admin)", guild=guild)
     async def maj(interaction: discord.Interaction) -> None:
         await handlers.request_server_action(bot, interaction, "update")
 
     @tree.command(name="sauvegarde", description="Créer une archive des parties (admin)", guild=guild)
     async def sauvegarde(interaction: discord.Interaction) -> None:
         await handlers.create_backup(bot, interaction)
+
+    @tree.command(name="logs", description="Dernières lignes de logs du serveur Icarus (admin)", guild=guild)
+    @app_commands.describe(lignes=f"Nombre de lignes (1 à {LOGS_MAX_LINES}, 50 par défaut)")
+    async def logs(interaction: discord.Interaction, lignes: app_commands.Range[int, 1, LOGS_MAX_LINES] = 50) -> None:
+        if not await bot.require_admin(interaction, "consultation des logs"):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            lines = await bot.recent_logs(lignes)
+        except Exception as e:  # noqa: BLE001 - DockerError, APIError...
+            await interaction.followup.send(f"❌ Logs indisponibles : {e}", ephemeral=True)
+            return
+        text = format_logs(lines)
+        if text is not None:
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            stamp = datetime.now(bot.config.timezone).strftime("%Y%m%d-%H%M%S")
+            payload = io.BytesIO(("\n".join(lines) + "\n").encode("utf-8"))
+            await interaction.followup.send(
+                f"📜 {len(lines)} dernière(s) ligne(s) de `{bot.config.container_name}`",
+                file=discord.File(payload, filename=f"icarus-logs-{stamp}.txt"),
+                ephemeral=True,
+            )
 
     @tree.command(name="panneaux", description="Republier / rafraîchir les panneaux (admin)", guild=guild)
     async def panneaux(interaction: discord.Interaction) -> None:

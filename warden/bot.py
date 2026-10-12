@@ -1,4 +1,4 @@
-"""Client Discord : panneaux persistants, boucles de surveillance et opérations sur le serveur."""
+"""Discord client: persistent panels, monitoring loops and server operations."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ from .events import (
     UNEXPECTED_RESTART,
     EventClassifier,
 )
-from .logpatterns import LABELS, LogPatterns
+from .logpatterns import LABELS, LogPatterns, normalize_line, should_publish
 from .notify import Notifier
 from .panels import ServerInfo, SettingsInfo, backups_panel, server_panel, settings_panel
 from .pending import Pending
@@ -40,17 +40,19 @@ from .state import ALERT_KEYS, State
 log = logging.getLogger(__name__)
 
 HEARTBEAT_FILE = Path("/tmp/warden-heartbeat")
-INVITE_PERMISSIONS = 199680  # Voir salons, Envoyer, Lire l'historique, Mentionner les rôles
+INVITE_PERMISSIONS = 199680  # View channels, Send, Read history, Mention roles
+# A "fully installed" line is published if the build changed in the last 10 minutes.
+UPDATE_LINE_WINDOW = 600.0
 
 
 class Busy(Exception):
-    """Une opération sur le serveur est déjà en cours."""
+    """A server operation is already in progress."""
 
 
 class WardenBot(discord.Client):
     def __init__(self, config: Config, docker_client: Any = None) -> None:
         intents = discord.Intents.none()
-        intents.guilds = True  # suffisant : les rôles du membre arrivent avec chaque interaction
+        intents.guilds = True  # enough: the member's roles come with every interaction
         super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.config = config
         self.tree = app_commands.CommandTree(self)
@@ -67,6 +69,7 @@ class WardenBot(discord.Client):
         self._rendered: dict[str, int] = {}
         self._panel_locks: dict[str, asyncio.Lock] = {}
         self._schedule_run: sch.Run | None = None
+        self._build_changed_at: float | None = None
         self._presence: str | None = None
         self._started = False
         self._closing = threading.Event()
@@ -74,7 +77,7 @@ class WardenBot(discord.Client):
         self._refresh_task: asyncio.Task[None] | None = None
         self._refresh_again = False
 
-    # ================================================================== démarrage
+    # ================================================================== start-up
     async def setup_hook(self) -> None:
         from . import commands
 
@@ -86,7 +89,7 @@ class WardenBot(discord.Client):
     async def on_ready(self) -> None:
         log.info("Connecté en tant que %s (%s)", self.user, self.user.id if self.user else "?")
         if self._started:
-            return  # reconnexion : les boucles tournent déjà
+            return  # reconnection: the loops are already running
         self._started = True
         app_id = self.application_id
         log.info(
@@ -148,7 +151,7 @@ class WardenBot(discord.Client):
     # ================================================================== interactions
     async def on_interaction(self, interaction: discord.Interaction) -> None:
         if interaction.type != discord.InteractionType.component:
-            return  # slash commands : CommandTree ; modals : classes Modal
+            return  # slash commands: CommandTree; modals: Modal classes
         custom_id = str((interaction.data or {}).get("custom_id", ""))
         if not custom_id.startswith("wi:"):
             return
@@ -168,10 +171,10 @@ class WardenBot(discord.Client):
             except discord.HTTPException:
                 pass
 
-    # ================================================================== opérations serveur
+    # ================================================================== server operations
     @asynccontextmanager
     async def operation(self, name: str) -> AsyncIterator[None]:
-        """Une seule opération à la fois ; les événements Docker qu'elle produit sont « attendus »."""
+        """One operation at a time; the Docker events it produces are "expected"."""
         if self._op_lock.locked():
             raise Busy(self.current_operation or "une opération")
         async with self._op_lock:
@@ -195,7 +198,7 @@ class WardenBot(discord.Client):
         return False
 
     async def server_action(self, action: str) -> tuple[bool, str]:
-        """start / stop / restart / update. Retourne (succès, message). Lève Busy."""
+        """start / stop / restart / update. Return (success, message). Raise Busy."""
         labels = {"start": "Démarrage", "stop": "Arrêt", "restart": "Redémarrage", "update": "Mise à jour"}
         async with self.operation(labels[action]):
             status = await asyncio.to_thread(self.docker.status)
@@ -224,20 +227,23 @@ class WardenBot(discord.Client):
                     await asyncio.to_thread(self.docker.restart, self.config.stop_timeout)
                     return True, "✅ Serveur redémarré. Comptez quelques minutes avant de pouvoir rejoindre."
                 if action == "update":
-                    if status.running:
-                        await asyncio.to_thread(self.docker.restart, self.config.stop_timeout)
-                    else:
-                        await asyncio.to_thread(self.docker.start)
+                    if not status.running:
+                        return False, (
+                            "⚠️ Le serveur est arrêté : utilise **Démarrer**, l'image vérifie les mises à jour "
+                            "à chaque démarrage."
+                        )
+                    output = await asyncio.to_thread(self.docker.force_update)
                     return True, (
-                        "✅ Conteneur redémarré : la dernière version d'Icarus s'installe au démarrage. "
-                        "Un message « Mise à jour » sera publié si un nouveau build est installé."
+                        f"✅ Mise à jour forcée lancée (`{output or 'icarus-force-update: started'}`).\n"
+                        "L'image réinstalle Icarus puis relance le jeu : le serveur est indisponible pendant "
+                        "le téléchargement. Un message « Mise à jour » sera publié quand le nouveau build sera installé."
                     )
             except Exception as e:  # noqa: BLE001 - DockerError, APIError, requests…
                 log.exception("Échec de l'action %s", action)
                 return False, f"❌ Échec : {e}"
         return False, "Action inconnue."
 
-    # ================================================================== informations
+    # ================================================================== information
     async def server_info(self, with_stats: bool = True) -> ServerInfo:
         status: ContainerStatus = await asyncio.to_thread(self.docker.status)
         stats: Stats | None = None
@@ -249,7 +255,8 @@ class WardenBot(discord.Client):
         players = self.players if status.running else None
         name = (
             (players.server_name if players else None)
-            or status.env.get("SERVERNAME")
+            or status.env.get("SERVER_NAME")
+            or status.env.get("SERVERNAME")  # old image (nerodon)
             or "Serveur Icarus"
         )
         scheduled = self.state.scheduled_restart_time if self.state.scheduled_restart_enabled else None
@@ -274,14 +281,20 @@ class WardenBot(discord.Client):
             return ""
 
     async def settings_info(self) -> SettingsInfo:
-        def gather() -> tuple[dict[str, str], bool, str]:
+        def gather() -> tuple[dict[str, str], bool, dict[str, str], bool, str]:
             try:
-                return ss.read_env(self.config.icarus_env_file), True, self._read_compose()
+                env, env_ok = ss.read_env(self.config.icarus_env_file), True
             except OSError as e:
                 log.warning(".env d'Icarus illisible : %s", e)
-                return {}, False, self._read_compose()
+                env, env_ok = {}, False
+            try:
+                ini, ini_ok = ss.read_ini(self.config.server_settings_file), self.config.server_settings_file.exists()
+            except (OSError, UnicodeError) as e:
+                log.warning("ServerSettings.ini illisible : %s", e)
+                ini, ini_ok = {}, False
+            return env, env_ok, ini, ini_ok, self._read_compose()
 
-        env_values, readable, compose_text = await asyncio.to_thread(gather)
+        env_values, env_ok, ini_values, ini_ok, compose_text = await asyncio.to_thread(gather)
         status = await asyncio.to_thread(self.docker.status)
         editable = ss.editable_keys(compose_text)
         pending = ss.pending_keys(env_values, status.env, editable) if status.exists else set()
@@ -291,10 +304,11 @@ class WardenBot(discord.Client):
             scheduled_enabled=self.state.scheduled_restart_enabled,
             scheduled_time=self.state.scheduled_restart_time,
             tz_name=str(self.config.timezone),
-            env_values=env_values,
+            env_values=ss.current_values(env_values, ini_values),
             editable=editable,
             pending=pending,
-            env_readable=readable,
+            env_readable=env_ok,
+            ini_readable=ini_ok,
         )
 
     def _backups_data(self) -> tuple[list[bk.Prospect], list[tuple[str, datetime, int]]]:
@@ -306,9 +320,9 @@ class WardenBot(discord.Client):
             archives.append((path.name, datetime.fromtimestamp(st.st_mtime, tz), st.st_size))
         return prospects, archives
 
-    # ================================================================== panneaux
+    # ================================================================== panels
     async def _ensure_panel(self, name: str, channel_id: int, spec: ui.MessageSpec, force: bool = False) -> None:
-        """Édite le message du panneau, ou le crée s'il n'existe pas (sans toucher aux autres messages)."""
+        """Edit the panel message, or create it if missing (without touching other messages)."""
         lock = self._panel_locks.setdefault(name, asyncio.Lock())
         async with lock:
             digest = hash(spec)
@@ -335,7 +349,7 @@ class WardenBot(discord.Client):
             await self._cleanup_own_messages(channel, keep=msg.id)
 
     async def _cleanup_own_messages(self, channel: discord.TextChannel, keep: int) -> None:
-        """À la création d'un panneau : retire les anciens messages *de ce bot* (anciens panneaux)."""
+        """When a panel is created: remove the older messages *from this bot* (old panels)."""
         try:
             async for old in channel.history(limit=50):
                 if old.id != keep and self.user and old.author.id == self.user.id:
@@ -370,7 +384,7 @@ class WardenBot(discord.Client):
                 log.exception("Échec du rafraîchissement d'un panneau")
 
     def schedule_panel_refresh(self) -> None:
-        """Rafraîchit le panneau serveur sans bloquer l'appelant (événement, début/fin d'action)."""
+        """Refresh the server panel without blocking the caller (event, start/end of an action)."""
         if not self.is_ready():
             return
         self._refresh_again = True
@@ -378,7 +392,7 @@ class WardenBot(discord.Client):
             self._refresh_task = asyncio.create_task(self._refresh_until_clean())
 
     async def _refresh_until_clean(self) -> None:
-        # Une demande arrivée pendant un rafraîchissement en relance un autre (état final garanti).
+        # A request arriving during a refresh triggers another one (final state guaranteed).
         while self._refresh_again:
             self._refresh_again = False
             await self._safe(self.refresh_server_panel)
@@ -402,7 +416,7 @@ class WardenBot(discord.Client):
             self._presence = text
             await self.change_presence(activity=discord.Game(text))
 
-    # ================================================================== boucles
+    # ================================================================== loops
     async def _panel_loop(self) -> None:
         while True:
             await asyncio.sleep(self.config.panel_refresh_seconds)
@@ -413,20 +427,31 @@ class WardenBot(discord.Client):
             except OSError:
                 pass
 
-    async def _check_buildid(self) -> None:
+    async def _check_buildid(self) -> bool:
+        """Publish "Update installed" if the build changed. Return True in that case."""
         buildid = await asyncio.to_thread(read_buildid, self.config.game_dir)
         if not buildid or buildid == self.state.last_buildid:
-            return
+            return False
         previous = self.state.last_buildid
         self.state.set_last_buildid(buildid)
-        if previous:
-            await self.notifier.alert(
-                "update",
-                "⬆️ Mise à jour d'Icarus installée",
-                f"Build **{previous}** → **{buildid}**.",
-                ui.Colors.BRAND,
-                tags="arrow_up",
-            )
+        if not previous:
+            return False
+        self._build_changed_at = time.monotonic()
+        await self.notifier.alert(
+            "update",
+            "⬆️ Mise à jour d'Icarus installée",
+            f"Build **{previous}** → **{buildid}**.",
+            ui.Colors.BRAND,
+            tags="arrow_up",
+        )
+        return True
+
+    async def _real_update_happened(self) -> bool:
+        """True if the build just changed (here, or during the last pass of the panel loop)."""
+        if await self._check_buildid():
+            return True
+        changed_at = self._build_changed_at
+        return changed_at is not None and time.monotonic() - changed_at < UPDATE_LINE_WINDOW
 
     async def _player_loop(self) -> None:
         previous: pl.Snapshot | None = None
@@ -453,7 +478,7 @@ class WardenBot(discord.Client):
             await asyncio.sleep(self.config.player_poll_seconds)
 
     def _pump(self, name: str, source: Callable[[], Iterator[Any]], queue: asyncio.Queue[Any]) -> None:
-        """Lit un flux Docker bloquant dans un thread et pousse chaque élément dans la queue."""
+        """Read a blocking Docker stream in a thread and push each item into the queue."""
         loop = asyncio.get_running_loop()
 
         def run() -> None:
@@ -463,7 +488,7 @@ class WardenBot(discord.Client):
                         loop.call_soon_threadsafe(queue.put_nowait, item)
                         if self._closing.is_set():
                             return
-                except Exception as e:  # noqa: BLE001 - socket coupé, conteneur absent…
+                except Exception as e:  # noqa: BLE001 - socket closed, container missing...
                     log.debug("Flux %s interrompu : %s", name, e)
                 self._closing.wait(5)
 
@@ -547,15 +572,23 @@ class WardenBot(discord.Client):
 
     async def _handle_log_line(self, line: str) -> None:
         match = self.patterns.classify(line)
-        if match is None:
+        if match is None or not should_publish(match.category, self.config.error_logs_to_discord):
             return
         if match.category in ("join", "leave"):
             if self.config.player_detection in ("logs", "both"):
-                who = f"**{match.name}**" if match.name else "Un joueur"
+                who = f"**{ui.md(match.name)}**" if match.name else "Un joueur"
                 verb = "a rejoint" if match.category == "join" else "a quitté"
                 await self.notifier.post(f"{LABELS[match.category]} {who} {verb} la partie")
             return
+        if match.category == "update" and not await self._real_update_happened():
+            return  # "already up to date", or reinstall of the same build
         await self.notifier.queue_log_line(f"{LABELS.get(match.category, '•')} {match.line}")
+
+    async def recent_logs(self, count: int) -> list[str]:
+        """Last N lines of the container, normalised (for /logs)."""
+        raw = await asyncio.to_thread(self.docker.tail, count)
+        lines = (normalize_line(line) for line in raw)
+        return [line.display for line in lines if line.text]
 
     async def _log_flush_loop(self) -> None:
         while True:
@@ -578,7 +611,7 @@ class WardenBot(discord.Client):
         at = sch.parse_hhmm(self.state.scheduled_restart_time)
         target = sch.next_target(now, at)
         if self.current_operation and now >= target:
-            return  # une action est en cours : on retentera au prochain passage
+            return  # an action is in progress: retry on the next pass
         status = await asyncio.to_thread(self.docker.status)
         count: int | None = None
         if status.running and now >= target:
@@ -623,7 +656,7 @@ class WardenBot(discord.Client):
         elif decision.action == sch.Action.SKIP_STOPPED:
             log.info("Redémarrage planifié ignoré : serveur arrêté")
 
-    # ================================================================== utilitaires
+    # ================================================================== utilities
     def disk_usage(self) -> tuple[int, int, int] | None:
         try:
             usage = shutil.disk_usage(self.config.icarus_dir)

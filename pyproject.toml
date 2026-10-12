@@ -1,7 +1,7 @@
 [project]
 name = "warden-icarus"
 version = "1.0.0"
-description = "Bot Discord d'administration d'un serveur Icarus dédié (Docker, Linux)"
+description = "Discord bot that administers an Icarus dedicated server (Docker, Linux)"
 requires-python = ">=3.12"
 
 [tool.pytest.ini_options]

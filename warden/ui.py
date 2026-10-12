@@ -1,9 +1,9 @@
-"""Mise en forme Components V2 (conteneur + barre de couleur + séparateurs), comme l'ancien bot.
+"""Components V2 layout (container + colour bar + separators), like the old bot.
 
-Les messages sont d'abord décrits par des « specs » (données pures, comparables) puis rendus
-en `discord.ui.LayoutView`. Les vues sont envoyées « arrêtées » : discord.py ne les garde
-pas en mémoire et tous les clics passent par le routeur `on_interaction` du bot, ce qui
-rend les boutons persistants entre deux redémarrages du bot.
+Messages are first described as "specs" (pure, comparable data), then rendered as
+`discord.ui.LayoutView`. Views are sent "stopped": discord.py does not keep them in memory
+and every click goes through the bot's `on_interaction` router, which keeps buttons working
+across bot restarts.
 """
 
 from __future__ import annotations
@@ -56,19 +56,19 @@ class SelectSpec:
     disabled: bool = False
 
 
-Row = tuple  # tuple[ButtonSpec, ...] ou tuple[SelectSpec]
+Row = tuple  # tuple[ButtonSpec, ...] or tuple[SelectSpec]
 
 
 @dataclass(frozen=True)
 class MessageSpec:
-    """Blocs affichés dans l'ordre, séparés par un séparateur : texte (str) ou rangée de composants."""
+    """Blocks shown in order, separated by a separator: text (str) or a row of components."""
 
     blocks: tuple = field(default_factory=tuple)
     color: int = Colors.BRAND
 
 
 def message(text: str, color: int = Colors.BRAND, *rows: Row) -> MessageSpec:
-    """Texte découpé en paragraphes (ligne vide = séparateur), puis rangées de composants."""
+    """Text split into paragraphs (empty line = separator), then rows of components."""
     blocks: list = [b for b in re.split(r"\n{2,}", text.strip()) if b.strip()]
     blocks.extend(r for r in rows if r)
     return MessageSpec(tuple(blocks), color)
@@ -117,23 +117,36 @@ def render(spec: MessageSpec) -> discord.ui.LayoutView:
                 )
         container.add_item(row)
     view.add_item(container)
-    view.stop()  # pas de stockage côté discord.py : le routeur du bot gère les clics
+    view.stop()  # no storage on the discord.py side: the bot's router handles clicks
     return view
 
 
-# --------------------------------------------------------------------------- réponses éphémères
+# --------------------------------------------------------------------------- ephemeral replies
 async def respond(interaction: discord.Interaction, text: str, color: int = Colors.BRAND, *rows: Row) -> None:
-    """Première réponse à une interaction : nouveau message éphémère."""
+    """First reply to an interaction: new ephemeral message."""
     await interaction.response.send_message(view=render(message(text, color, *rows)), ephemeral=True)
 
 
 async def update(interaction: discord.Interaction, text: str, color: int = Colors.BRAND, *rows: Row) -> None:
-    """Met à jour le message de l'interaction (le message cliqué, ou la réponse déjà envoyée)."""
+    """Update the interaction's message (the clicked message, or the reply already sent)."""
     view = render(message(text, color, *rows))
     if interaction.response.is_done():
         await interaction.edit_original_response(view=view)
     else:
         await interaction.response.edit_message(view=view)
+
+
+# --------------------------------------------------------------------------- untrusted text
+# Player names (A2S), save names (chosen in game), Discord nicknames, values read from
+# ServerSettings.ini: never interpreted as markdown (fake links, headings, formatting).
+def md(text: object) -> str:
+    """Text shown as is in a markdown message."""
+    return discord.utils.escape_markdown(str(text))
+
+
+def code(text: object) -> str:
+    """Text placed between backticks: a ` in the value would close the block."""
+    return str(text).replace("`", "ˋ")
 
 
 # --------------------------------------------------------------------------- formats

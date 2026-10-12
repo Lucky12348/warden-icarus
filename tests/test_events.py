@@ -62,7 +62,7 @@ def test_bot_operations_are_expected():
     assert run(c, clock, ev("kill"), ev("die", 143), ev("stop"), ev("start"), ev("restart")) == [EXPECTED] * 5
     c.end_operation()
     clock.t += 10
-    assert c.classify(ev("start")).kind == EXPECTED  # événement tardif
+    assert c.classify(ev("start")).kind == EXPECTED  # late event
     clock.t += 60
     assert c.classify(ev("die", 1)).kind == CRASH
 

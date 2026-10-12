@@ -1,4 +1,4 @@
-"""État persistant du bot (state/state.json) : interrupteurs, IDs des panneaux, planification."""
+"""Persistent bot state (state/state.json): toggles, panel IDs, scheduling."""
 
 from __future__ import annotations
 
@@ -22,14 +22,38 @@ ALERT_LABELS = {
 }
 
 
+# 2: mornedhels/icarus-server image, which updates the game itself (scheduled restart disabled).
+SCHEMA_VERSION = 2
+
+
 def default_state(scheduled_time: str = "06:00") -> dict[str, Any]:
     return {
+        "schema": SCHEMA_VERSION,
         "alerts": {key: True for key in ALERT_KEYS},
-        # Équivalent de restartcrontab=1 "0 6 * * *" de l'ancien bot.
-        "scheduled_restart": {"enabled": True, "time": scheduled_time},
+        # Off by default: the image already handles updates (UPDATE_CRON, empty server).
+        "scheduled_restart": {"enabled": False, "time": scheduled_time},
         "panel_messages": {},  # "panel" / "backups" / "settings" -> [channel_id, message_id]
         "last_buildid": None,
     }
+
+
+def _schema(loaded: dict[str, Any]) -> int:
+    """File version (1 if missing or unreadable: the migration is safe)."""
+    try:
+        return int(loaded.get("schema") or 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _migrate(loaded: dict[str, Any]) -> dict[str, Any]:
+    if _schema(loaded) < 2:
+        # Old image (nerodon): the daily restart was used for updates.
+        sched = loaded.get("scheduled_restart")
+        if isinstance(sched, dict) and sched.get("enabled"):
+            log.info("Migration de l'état : redémarrage planifié désactivé (l'image gère les mises à jour)")
+            sched["enabled"] = False
+        loaded["schema"] = 2
+    return loaded
 
 
 def _merge(defaults: dict[str, Any], loaded: dict[str, Any]) -> dict[str, Any]:
@@ -43,19 +67,23 @@ def _merge(defaults: dict[str, Any], loaded: dict[str, Any]) -> dict[str, Any]:
 
 
 class State:
-    """Petit magasin JSON, écrit de façon atomique (fichier temporaire + rename)."""
+    """Small JSON store, written atomically (temporary file + rename)."""
 
     def __init__(self, path: Path, scheduled_time: str = "06:00") -> None:
         self.path = path
         self._lock = threading.Lock()
         self._data = default_state(scheduled_time)
+        migrated = False
         if path.exists():
             try:
                 loaded = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
-                    self._data = _merge(self._data, loaded)
+                    migrated = _schema(loaded) < SCHEMA_VERSION
+                    self._data = _merge(self._data, _migrate(loaded))
             except (OSError, ValueError) as e:
                 log.warning("state.json illisible (%s), valeurs par défaut utilisées", e)
+        if migrated:
+            self.save()
 
     def save(self) -> None:
         with self._lock:
@@ -64,7 +92,7 @@ class State:
             tmp.write_text(json.dumps(self._data, indent=2, ensure_ascii=False), encoding="utf-8")
             os.replace(tmp, self.path)
 
-    # --- alertes ---
+    # --- alerts ---
     def alert_enabled(self, key: str) -> bool:
         return bool(self._data["alerts"].get(key, True))
 
@@ -75,7 +103,7 @@ class State:
         self.save()
         return self._data["alerts"][key]
 
-    # --- redémarrage planifié ---
+    # --- scheduled restart ---
     @property
     def scheduled_restart_enabled(self) -> bool:
         return bool(self._data["scheduled_restart"]["enabled"])
@@ -93,7 +121,7 @@ class State:
         self._data["scheduled_restart"]["time"] = hhmm
         self.save()
 
-    # --- messages des panneaux ---
+    # --- panel messages ---
     def panel_message(self, name: str) -> tuple[int, int] | None:
         ref = self._data["panel_messages"].get(name)
         if not ref:
@@ -104,7 +132,7 @@ class State:
         self._data["panel_messages"][name] = [channel_id, message_id]
         self.save()
 
-    # --- build du jeu (détection de mise à jour) ---
+    # --- game build (update detection) ---
     @property
     def last_buildid(self) -> str | None:
         return self._data.get("last_buildid")

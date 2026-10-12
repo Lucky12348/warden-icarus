@@ -1,8 +1,8 @@
-"""Gestion des clics (boutons, menus) et des modals.
+"""Handling of clicks (buttons, menus) and modals.
 
-Format des custom_id : `wi:<zone>:<action>[:<jeton>]`, zones `srv` (panneau serveur),
-`bak` (sauvegardes) et `set` (réglages). Lecture seule pour tous (Infos, Actualiser) ;
-tout le reste exige le rôle admin, vérifié à chaque étape (y compris à la confirmation).
+custom_id format: `wi:<zone>:<action>[:<token>]`, zones `srv` (server panel),
+`bak` (backups) and `set` (settings). Read-only for everyone (Info, Refresh);
+everything else requires the admin role, checked at every step (confirmation included).
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import discord
 
@@ -19,7 +19,7 @@ from . import settings_store as ss
 from .panels import info_text, restore_point_label, server_panel
 from .scheduler import parse_hhmm
 from .state import ALERT_KEYS, ALERT_LABELS
-from .ui import ButtonSpec, Colors, OptionSpec, SelectSpec, respond, update
+from .ui import ButtonSpec, Colors, OptionSpec, SelectSpec, code, md, respond, update
 
 if TYPE_CHECKING:
     from .bot import WardenBot
@@ -30,7 +30,7 @@ SERVER_ACTIONS = {
     "start": ("démarrage", "Démarrer"),
     "stop": ("arrêt", "Arrêter"),
     "restart": ("redémarrage", "Redémarrer"),
-    "update": ("mise à jour (redémarrage)", "Mettre à jour"),
+    "update": ("mise à jour forcée", "Mettre à jour"),
 }
 
 def _cancel(zone: str) -> ButtonSpec:
@@ -57,12 +57,13 @@ async def _expired(interaction: discord.Interaction) -> None:
     await update(interaction, "⌛ Cette sélection a expiré (ou le bot a redémarré). Recommence depuis le panneau.", Colors.NEUTRAL)
 
 
-# ====================================================================== serveur
+# ====================================================================== server
 async def server_component(bot: "WardenBot", interaction: discord.Interaction, action: str, arg: str) -> None:
     if action == "info":
         await respond(interaction, "⏳ Récupération des informations…", Colors.NEUTRAL)
         info = await bot.server_info()
-        await update(interaction, info_text(info, info.status.env.get("PORT", "32768"), bot.config.a2s_port), Colors.BRAND)
+        port = info.status.env.get("SERVER_PORT") or info.status.env.get("PORT", "32768")
+        await update(interaction, info_text(info, port, bot.config.a2s_port), Colors.BRAND)
         return
     if action == "cancel":
         await update(interaction, "❎ Annulé.", Colors.NEUTRAL)
@@ -81,7 +82,7 @@ async def server_component(bot: "WardenBot", interaction: discord.Interaction, a
 
 
 async def request_server_action(bot: "WardenBot", interaction: discord.Interaction, action: str) -> None:
-    """Point d'entrée commun aux boutons et aux slash commands."""
+    """Common entry point for buttons and slash commands."""
     label, button = SERVER_ACTIONS[action]
     if not await bot.require_admin(interaction, label):
         return
@@ -89,6 +90,15 @@ async def request_server_action(bot: "WardenBot", interaction: discord.Interacti
         await respond(interaction, f"⏳ Une opération est déjà en cours : **{bot.current_operation}**.", Colors.WARNING)
         return
     players = bot.players
+    if action == "update" and players is not None and players.count > 0:
+        # The image's updater refuses to update a busy server.
+        await respond(
+            interaction,
+            f"⚠️ {players.summary} connecté(s) : l'image ne met pas Icarus à jour tant que des joueurs sont "
+            "connectés. Réessaie quand le serveur est vide (l'image le fera aussi seule via UPDATE_CRON).",
+            Colors.WARNING,
+        )
+        return
     if action != "start" and players is not None and players.count > 0:
         token = bot.pending.put(interaction.user.id, action=action)
         await respond(
@@ -107,7 +117,7 @@ async def run_server_action(bot: "WardenBot", interaction: discord.Interaction, 
 
     label, _ = SERVER_ACTIONS[action]
     pending = f"⏳ Commande envoyée — {label} en cours…"
-    if action in ("stop", "restart", "update"):
+    if action in ("stop", "restart"):
         pending += f"\n-# Arrêt propre : jusqu'à {bot.config.stop_timeout} s pour laisser le jeu sauvegarder."
     if edit:
         await update(interaction, pending, Colors.WARNING)
@@ -123,10 +133,10 @@ async def run_server_action(bot: "WardenBot", interaction: discord.Interaction, 
     await bot.notifier.action(interaction.user, f"Serveur — {label}", result, color)
 
 
-# ====================================================================== sauvegardes
+# ====================================================================== backups
 async def backups_component(bot: "WardenBot", interaction: discord.Interaction, action: str, arg: str) -> None:
     if action == "refresh":
-        await interaction.response.defer()  # clic sur le panneau : simple accusé de réception
+        await interaction.response.defer()  # click on the panel: plain acknowledgement
         await bot.refresh_backups_panel(force=True)
         return
     if action == "cancel":
@@ -157,7 +167,7 @@ async def create_backup(bot: "WardenBot", interaction: discord.Interaction) -> N
     try:
         async with bot.operation("Sauvegarde"):
             now = datetime.now(cfg.timezone)
-            result = await asyncio.to_thread(bk.create_archive, cfg.saves_root, cfg.backup_dir, cfg.prospects_rel, now)
+            result = await asyncio.to_thread(bk.create_archive, cfg.saves_root, cfg.backup_dir, cfg.prospects_rel, now, root=cfg.data_dir)
             removed = await asyncio.to_thread(bk.apply_retention, cfg.backup_dir, cfg.backup_retention)
     except Busy as e:
         await update(interaction, f"⏳ Une opération est déjà en cours : **{e}**.", Colors.WARNING)
@@ -170,7 +180,7 @@ async def create_backup(bot: "WardenBot", interaction: discord.Interaction) -> N
         return
     text = (
         f"✅ Archive `{result.path.name}` créée — {result.files} fichier(s), {bk.human_size(result.size)}.\n"
-        f"Parties : {', '.join(result.prospects) or 'aucune'}"
+        f"Parties : {', '.join(md(p) for p in result.prospects) or 'aucune'}"
     )
     if removed:
         text += f"\nRétention ({cfg.backup_retention}) : {len(removed)} ancienne(s) archive(s) supprimée(s)."
@@ -217,12 +227,12 @@ async def _restore_pick_point(bot: "WardenBot", interaction: discord.Interaction
         return
     options = tuple(restore_point_label(p, cfg.timezone) for p in points if len(p.token) <= 100)[:25]
     if not options:
-        await update(interaction, f"⚠️ Aucune sauvegarde trouvée pour **{prospect}**.", Colors.DANGER)
+        await update(interaction, f"⚠️ Aucune sauvegarde trouvée pour **{md(prospect)}**.", Colors.DANGER)
         return
     token = bot.pending.put(interaction.user.id, prospect=prospect)
     await update(
         interaction,
-        f"# ♻️ Restauration\n\nPartie : **{prospect}**\n\nChoisis la **sauvegarde** (la plus récente en premier).",
+        f"# ♻️ Restauration\n\nPartie : **{md(prospect)}**\n\nChoisis la **sauvegarde** (la plus récente en premier).",
         Colors.BRAND,
         (SelectSpec(f"wi:bak:point:{token}", "Choisir une sauvegarde…", options),),
         (_cancel("bak"),),
@@ -246,10 +256,10 @@ async def _restore_confirm(bot: "WardenBot", interaction: discord.Interaction, t
     warn = f"\n\n⚠️ **{players.summary} connecté(s)** : ils seront déconnectés." if players and players.count else ""
     await update(
         interaction,
-        f"# ⚠️ Confirmation\n\n🗺️ Partie : **{prospect}**\n💾 Sauvegarde : `{ref}`"
+        f"# ⚠️ Confirmation\n\n🗺️ Partie : **{md(prospect)}**\n💾 Sauvegarde : `{code(ref)}`"
         f"{' (archive du bot)' if source == 'archive' else ''}\n\n"
         f"1. ⏹️ Arrêt du serveur (jusqu'à {bot.config.stop_timeout} s)\n"
-        f"2. 📄 Copie de l'actuelle `{prospect}.json` en `.pre_restore_<date>`\n"
+        f"2. 📄 Copie de l'actuelle `{code(prospect)}.json` en `.pre_restore_<date>`\n"
         "3. ♻️ Remplacement par la sauvegarde choisie (qui est conservée)\n"
         f"4. ▶️ Redémarrage du serveur{warn}",
         Colors.WARNING,
@@ -269,7 +279,7 @@ async def _restore_run(bot: "WardenBot", interaction: discord.Interaction, token
         return
     prospect, source, ref = data["prospect"], data["source"], data["ref"]
     cfg = bot.config
-    action = f"Restauration — {prospect}"
+    action = f"Restauration — {md(prospect)}"
     await update(interaction, "⏹️ Arrêt du serveur avant restauration…", Colors.WARNING)
     try:
         async with bot.operation("Restauration"):
@@ -284,13 +294,13 @@ async def _restore_run(bot: "WardenBot", interaction: discord.Interaction, token
             try:
                 now = datetime.now(cfg.timezone)
                 result = await asyncio.to_thread(
-                    bk.restore_prospect, cfg.prospects_dir, cfg.backup_dir, prospect, source, ref, cfg.prospects_rel, now
+                    bk.restore_prospect, cfg.prospects_dir, cfg.backup_dir, prospect, source, ref, cfg.prospects_rel, now, root=cfg.data_dir
                 )
-                text = f"✅ `{ref}` restaurée vers `{prospect}.json`."
+                text = f"✅ `{code(ref)}` restaurée vers `{code(prospect)}.json`."
                 if result.pre_restore:
-                    text += f"\nAncienne version conservée : `{result.pre_restore.name}`"
+                    text += f"\nAncienne version conservée : `{code(result.pre_restore.name)}`"
                 color = Colors.SUCCESS
-            except Exception as e:  # noqa: BLE001 - fichiers intacts : on relance quand même
+            except Exception as e:  # noqa: BLE001 - files untouched: restart anyway
                 log.exception("Échec de restauration")
                 text, color = f"❌ Restauration impossible : {e}\nLa partie actuelle n'a pas été modifiée.", Colors.DANGER
             await update(interaction, f"{text}\n\n▶️ Redémarrage du serveur…", Colors.WARNING)
@@ -307,7 +317,7 @@ async def _restore_run(bot: "WardenBot", interaction: discord.Interaction, token
     await bot.refresh_backups_panel(force=True)
 
 
-# ====================================================================== réglages
+# ====================================================================== settings
 async def settings_component(bot: "WardenBot", interaction: discord.Interaction, action: str, arg: str) -> None:
     if action == "cancel":
         await update(interaction, "❎ Annulé, rien n'a été modifié.", Colors.NEUTRAL)
@@ -362,7 +372,7 @@ async def settings_component(bot: "WardenBot", interaction: discord.Interaction,
 
 
 async def _refresh_settings_in_place(bot: "WardenBot", interaction: discord.Interaction) -> None:
-    """Le panneau réglages est mis à jour sur place : l'état des interrupteurs est visible par tous."""
+    """The settings panel is updated in place: the state of the toggles is visible to everyone."""
     from .panels import settings_panel
     from .ui import render
 
@@ -376,12 +386,21 @@ async def _open_setting_modal(bot: "WardenBot", interaction: discord.Interaction
     defn = ss.SETTINGS_BY_KEY.get(values[0]) if values else None
     if defn is None:
         return
-    compose_text = await asyncio.to_thread(bot._read_compose)
-    if defn.key not in ss.editable_keys(compose_text):
-        await respond(interaction, f"🔒 `{defn.key}` est écrit en dur dans docker-compose.yml.", Colors.DANGER)
-        return
-    env = await asyncio.to_thread(ss.read_env, bot.config.icarus_env_file)
-    await interaction.response.send_modal(SettingModal(bot, defn, env.get(defn.key, "")))
+    if defn.storage == "ini":
+        try:
+            ini = await asyncio.to_thread(ss.read_ini, bot.config.server_settings_file)
+        except (OSError, UnicodeError) as e:
+            await respond(interaction, f"❌ ServerSettings.ini illisible : {e}", Colors.DANGER)
+            return
+        current = ss.ini_lookup(ini, defn.ini_key or defn.key) or ""
+    else:
+        compose_text = await asyncio.to_thread(bot._read_compose)
+        if defn.key not in ss.editable_keys(compose_text):
+            await respond(interaction, f"🔒 `{defn.key}` est écrit en dur dans docker-compose.yml.", Colors.DANGER)
+            return
+        env = await asyncio.to_thread(ss.read_env, bot.config.icarus_env_file)
+        current = env.get(defn.key, "")
+    await interaction.response.send_modal(SettingModal(bot, defn, current))
 
 
 async def _apply_setting(bot: "WardenBot", interaction: discord.Interaction, token: str, recreate: bool) -> None:
@@ -390,24 +409,64 @@ async def _apply_setting(bot: "WardenBot", interaction: discord.Interaction, tok
         await _expired(interaction)
         return
     key, value, summary = data["key"], data["value"], data["summary"]
+    defn = ss.SETTINGS_BY_KEY[key]
+    if defn.storage == "ini":
+        await _apply_ini_setting(bot, interaction, defn, value, summary)
+        return
+    # The image does not copy an empty variable into ServerSettings.ini: removing a password
+    # also requires clearing the .ini key, with the server stopped, during the recreation.
+    clear_ini = value == "" and defn.ini_key is not None
+    if clear_ini and not recreate:
+        await update(interaction, "⚠️ Une suppression doit être appliquée tout de suite : utilise **Appliquer et recréer**.", Colors.WARNING)
+        return
+    from .bot import Busy
+
     env_file = bot.config.icarus_env_file
     await update(interaction, "💾 Écriture du `.env`…", Colors.WARNING)
+    error: str | None = None
     try:
-        await asyncio.to_thread(ss.write_env, env_file, {key: value})
-        await asyncio.to_thread(bot.docker.compose_check)
-    except Exception as e:  # noqa: BLE001
-        log.exception("Échec d'écriture du réglage %s", key)
-        restored = await asyncio.to_thread(ss.restore_env_backup, env_file)
-        text = f"❌ Réglage non appliqué : {e}" + ("\n.env remis dans son état précédent (.env.bak)." if restored else "")
-        await update(interaction, text, Colors.DANGER)
-        await bot.notifier.action(interaction.user, "Réglages Icarus", f"{summary}\n{text}", Colors.DANGER)
+        # Under the operation lock: no concurrent .env write (two admins, recreation).
+        async with bot.operation("Réglages"):
+            backup = None
+            try:
+                backup = await asyncio.to_thread(ss.write_env, env_file, {key: value})
+                await asyncio.to_thread(bot.docker.compose_check)
+            except Exception as e:  # noqa: BLE001
+                log.exception("Échec d'écriture du réglage %s", key)
+                # Only the copy made by this write: an older .env.bak
+                # would undo a previous change.
+                restored = backup is not None and await asyncio.to_thread(ss.restore_env_backup, env_file)
+                error = f"❌ Réglage non appliqué : {e}" + ("\n.env remis dans son état précédent (.env.bak)." if restored else "")
+    except Busy as e:
+        await update(interaction, f"⏳ Une opération est déjà en cours : **{e}**. Rien n'a été modifié.", Colors.WARNING)
+        return
+    if error is not None:
+        await update(interaction, error, Colors.DANGER)
+        await bot.notifier.action(interaction.user, "Réglages Icarus", f"{summary}\n{error}", Colors.DANGER)
         return
     text = f"✅ {summary}\n.env mis à jour (copie précédente : `.env.bak`)."
     color = Colors.SUCCESS
     if recreate:
         await update(interaction, f"{text}\n\n🔁 Recréation du conteneur…", Colors.WARNING)
-        recreate_text, color = await _recreate(bot)
+        before_up = None
+        ini_errors: list[str] = []
+        if clear_ini:
+            ini_path, ini_key, data_dir = bot.config.server_settings_file, defn.ini_key, bot.config.data_dir
+
+            def before_up() -> None:
+                # Must never prevent the restart: the server is stopped at this point.
+                try:
+                    if ini_path.exists():
+                        ss.write_ini(ini_path, {ini_key: ""}, root=data_dir)
+                except Exception as e:  # noqa: BLE001
+                    log.exception("Échec d'effacement de %s dans ServerSettings.ini", ini_key)
+                    ini_errors.append(str(e))
+
+        recreate_text, color = await _recreate(bot, before_up)
         text += f"\n{recreate_text}"
+        if ini_errors:
+            text += f"\n⚠️ `{defn.ini_key}` n'a pas pu être effacé de `ServerSettings.ini` : {ini_errors[0]}"
+            color = Colors.WARNING
     else:
         text += "\n⏳ Sera appliqué à la prochaine recréation du conteneur."
     await update(interaction, text, color)
@@ -415,13 +474,55 @@ async def _apply_setting(bot: "WardenBot", interaction: discord.Interaction, tok
     await bot.refresh_settings_panel(force=True)
 
 
-async def _recreate(bot: "WardenBot") -> tuple[str, int]:
+async def _apply_ini_setting(bot: "WardenBot", interaction: discord.Interaction, defn: ss.SettingDef, value: str, summary: str) -> None:
+    """ServerSettings.ini: clean stop (the game rewrites this file), .bak copy, write, restart."""
+    from .bot import Busy
+
+    cfg = bot.config
+    path = cfg.server_settings_file
+    try:
+        async with bot.operation("Réglages"):
+            was_running = (await asyncio.to_thread(bot.docker.status)).running
+            if was_running:
+                await update(interaction, f"{summary}\n\n⏹️ Arrêt du serveur (jusqu'à {cfg.stop_timeout} s)…", Colors.WARNING)
+                await asyncio.to_thread(bot.docker.stop, cfg.stop_timeout)
+                if (await asyncio.to_thread(bot.docker.status)).running:
+                    text, color = "❌ Le serveur ne s'est pas arrêté : réglage non modifié.", Colors.DANGER
+                    await update(interaction, text, color)
+                    await bot.notifier.action(interaction.user, "Réglages Icarus", f"{summary}\n{text}", color)
+                    return
+            try:
+                await asyncio.to_thread(ss.write_ini, path, {defn.ini_key or defn.key: value}, root=cfg.data_dir)
+                text, color = f"✅ {summary}\n`ServerSettings.ini` mis à jour (copie précédente : `ServerSettings.ini.bak`).", Colors.SUCCESS
+            except Exception as e:  # noqa: BLE001 - atomic write: file untouched
+                log.exception("Échec d'écriture de %s dans ServerSettings.ini", defn.key)
+                text, color = f"❌ Réglage non appliqué : {e}\n`ServerSettings.ini` n'a pas été modifié.", Colors.DANGER
+            if was_running:
+                await update(interaction, f"{text}\n\n▶️ Redémarrage du serveur…", Colors.WARNING)
+                await asyncio.to_thread(bot.docker.start)
+                text += "\n▶️ Serveur redémarré."
+            else:
+                text += "\nℹ️ Serveur arrêté : le réglage s'appliquera au prochain démarrage."
+    except Busy as e:
+        await update(interaction, f"⏳ Une opération est déjà en cours : **{e}**.", Colors.WARNING)
+        return
+    except Exception as e:  # noqa: BLE001
+        log.exception("Échec pendant la modification de ServerSettings.ini")
+        text, color = f"❌ Erreur : {e}\n👉 Vérifie l'état du serveur et démarre-le si besoin.", Colors.DANGER
+    await update(interaction, text, color)
+    await bot.notifier.action(interaction.user, "Réglages Icarus", text, color)
+    await bot.refresh_settings_panel(force=True)
+
+
+async def _recreate(bot: "WardenBot", before_up: Callable[[], None] | None = None) -> tuple[str, int]:
     from .bot import Busy
 
     try:
         async with bot.operation("Recréation"):
             await asyncio.to_thread(bot.docker.compose_check)
-            await asyncio.to_thread(bot.docker.recreate, bot.config.stop_timeout, bot.config.recreate_timeout)
+            await asyncio.to_thread(
+                bot.docker.recreate, bot.config.stop_timeout, bot.config.recreate_timeout, before_up
+            )
         text, color = "✅ Conteneur recréé avec les nouveaux réglages. Démarrage d'Icarus en cours.", Colors.SUCCESS
     except Busy as e:
         text, color = f"⏳ Une opération est déjà en cours : **{e}**.", Colors.WARNING
@@ -471,8 +572,8 @@ class SettingModal(discord.ui.Modal):
         if value == self.current:
             await respond(interaction, "ℹ️ Valeur identique : rien à modifier.", Colors.NEUTRAL)
             return
-        before = ss.display_value(self.defn, self.current)
-        after = ss.display_value(self.defn, value)
+        before = md(ss.display_value(self.defn, self.current))
+        after = md(ss.display_value(self.defn, value))
         if self.defn.kind == "secret":
             summary = f"**{self.defn.label}** : modifié" if value else f"**{self.defn.label}** : supprimé"
         else:
@@ -480,18 +581,23 @@ class SettingModal(discord.ui.Modal):
         token = self.bot.pending.put(interaction.user.id, key=self.defn.key, value=value, summary=summary)
         players = self.bot.players
         warn = f"\n⚠️ **{players.summary} connecté(s)** : ils seront déconnectés." if players and players.count else ""
-        await respond(
-            interaction,
-            f"# ⚙️ Confirmer la modification\n\n{summary}\n\n"
-            "Le `.env` d'Icarus sera réécrit (copie `.env.bak`). Le changement ne prend effet qu'après "
-            f"**recréation du conteneur** (arrêt propre puis redémarrage).{warn}",
-            Colors.WARNING,
-            (
-                ButtonSpec("Appliquer et recréer", f"wi:set:apply:{token}", "danger"),
-                ButtonSpec("Enregistrer seulement", f"wi:set:save:{token}", "primary"),
-                _cancel("set"),
-            ),
-        )
+        if self.defn.storage == "ini":
+            body = (
+                f"`ServerSettings.ini` sera modifié (copie `ServerSettings.ini.bak`). Si le serveur tourne : "
+                f"arrêt propre, écriture, puis **redémarrage du serveur**.{warn}"
+            )
+            buttons = (ButtonSpec("Appliquer et redémarrer", f"wi:set:apply:{token}", "danger"), _cancel("set"))
+        else:
+            body = (
+                "Le `.env` d'Icarus sera réécrit (copie `.env.bak`). Le changement ne prend effet qu'après "
+                f"**recréation du conteneur** (arrêt propre puis redémarrage).{warn}"
+            )
+            apply = ButtonSpec("Appliquer et recréer", f"wi:set:apply:{token}", "danger")
+            if value == "" and self.defn.ini_key:
+                buttons = (apply, _cancel("set"))  # removal: also cleared from the .ini during the recreation
+            else:
+                buttons = (apply, ButtonSpec("Enregistrer seulement", f"wi:set:save:{token}", "primary"), _cancel("set"))
+        await respond(interaction, f"# ⚙️ Confirmer la modification\n\n{summary}\n\n{body}", Colors.WARNING, buttons)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
         log.exception("Erreur dans le modal de réglage", exc_info=error)
@@ -527,7 +633,7 @@ class ScheduleTimeModal(discord.ui.Modal):
         await self.bot.notifier.action(interaction.user, "Heure du redémarrage planifié", f"✅ {hhmm}")
 
 
-# ====================================================================== statut (slash)
+# ====================================================================== status (slash)
 async def status_reply(bot: "WardenBot", interaction: discord.Interaction) -> None:
     await respond(interaction, "⏳ Récupération de l'état…", Colors.NEUTRAL)
     info = await bot.server_info()

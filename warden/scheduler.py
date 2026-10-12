@@ -1,13 +1,12 @@
-"""Redémarrage planifié quotidien (équivalent du restartcrontab "0 6 * * *" de l'ancien bot).
+"""Daily scheduled restart (equivalent of the old bot's restartcrontab "0 6 * * *").
 
-Règles :
-- annonce dans le salon logs 5 min avant l'heure prévue ;
-- à l'heure prévue, pas de redémarrage si des joueurs sont connectés (A2S) : nouvel essai
-  toutes les 15 min, pendant 2 h maximum, puis abandon pour la journée ;
-- serveur déjà arrêté : rien à faire.
+Rules:
+- announced in the logs channel 5 min before the planned time;
+- at the planned time, no restart if players are connected (A2S): new attempt every
+  15 min, for 2 h at most, then give up for the day;
+- server already stopped: nothing to do.
 
-`decide()` est pur (aucune E/S) pour être testé facilement ; la boucle du bot l'appelle
-toutes les 30 s.
+`decide()` is pure (no I/O) so it is easy to test; the bot loop calls it every 30 s.
 """
 
 from __future__ import annotations
@@ -43,7 +42,7 @@ class Action(enum.Enum):
 
 @dataclass
 class Run:
-    """Suivi d'une occurrence (un jour donné) du redémarrage planifié."""
+    """Tracking of one occurrence (a given day) of the scheduled restart."""
 
     target: datetime
     announced: bool = False
@@ -64,7 +63,7 @@ class Decision:
 
 
 def next_target(now: datetime, at: time) -> datetime:
-    """Prochaine occurrence encore « active » (fenêtre de 2 h de réessais comprise)."""
+    """Next occurrence that is still "active" (2 h retry window included)."""
     tz = now.tzinfo
     for offset in (0, 1):
         day = now.date() + timedelta(days=offset)
@@ -83,7 +82,7 @@ def decide(
     players: int | None,
     restart_if_a2s_down: bool = False,
 ) -> Decision:
-    """`players` vaut None quand A2S ne répond pas (nombre de joueurs inconnu)."""
+    """`players` is None when A2S does not answer (unknown number of players)."""
     if not enabled:
         return Decision(Action.NONE, None)
 

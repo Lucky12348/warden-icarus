@@ -3,15 +3,28 @@
     "^\\s*$",
     "^[0-9a-f]{4}:(?:fixme|err|warn|trace):",
     "^(?:fixme|err|warn|trace):",
+    "^message repeated \\d+ times:",
     "setlocale\\(",
     "XDG_RUNTIME_DIR",
+    "\\bLog\\w+: Warning: (?!.*(?i:backup pool|out of memory|assertion failed|fatal error))",
     "LogFMOD:",
     "LogStreaming: Error",
     "LogProperty: Error: Struct type unknown",
-    "LogStringTable: Warning",
-    "CheatFunctions|FunctionalTesting|AutomationScreenshot"
+    "LogIcarusGameStateRecording: Error",
+    "IcarusOSSLog: Error",
+    "CheatFunctions|FunctionalTesting|AutomationScreenshot",
+    "ILocalize::AddFile\\(\\) failed",
+    "Failed to init SDL priority manager",
+    "Failed to set thread priority",
+    "dlmopen steamservice\\.so failed",
+    "ERROR \\((?:already started|not running)\\)",
+    "already running - exiting"
   ],
   "join": ["LogNet: Join succeeded: (?P<name>.+)"],
   "leave": ["LogNet: .*Player (?P<name>.+) (?:left|disconnected)"],
-  "startup": ["Engine is initialized", "Success! App '2089300' already up to date"]
+  "startup": ["Engine is initialized"],
+  "update": [
+    "Success! App '2089300' fully installed",
+    "Success! App '2089300' already up to date"
+  ]
 }

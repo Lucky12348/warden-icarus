@@ -1,4 +1,4 @@
-"""Configuration du bot, lue depuis les variables d'environnement (fichier .env du bot)."""
+"""Bot configuration, read from environment variables (the bot's .env file)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Mapping
 from zoneinfo import ZoneInfo
 
-# Le jeu a besoin de temps pour sauvegarder à l'arrêt (SAVEGAMEONEXIT) : jamais moins de 60 s.
+# The game needs time to save on shutdown (SaveGameOnExit): never less than 60 s.
+# 90 s by default, like supervisord's stopwaitsecs in the mornedhels image.
+DEFAULT_STOP_TIMEOUT = 90
 MIN_STOP_TIMEOUT = 60
 
 
@@ -81,13 +83,15 @@ class Config:
     log_patterns_file: Path | None
     log_dedupe_seconds: int
     log_max_per_minute: int
-    player_detection: str  # "a2s", "logs" ou "both"
+    error_logs_to_discord: bool  # also publish the "error" category (off by default)
+    log_spam_summary: bool  # hourly summary of lines dropped by the anti-spam (off by default)
+    player_detection: str  # "a2s", "logs" or "both"
 
     clean_exit_codes: frozenset[int]
     scheduled_restart_default_time: str
     scheduled_restart_if_a2s_down: bool
 
-    # --- chemins dérivés de ICARUS_DIR ---
+    # --- paths derived from ICARUS_DIR ---
     @property
     def icarus_env_file(self) -> Path:
         return self.icarus_dir / ".env"
@@ -105,11 +109,16 @@ class Config:
         return self.icarus_dir / "game"
 
     @property
+    def server_settings_file(self) -> Path:
+        """Game settings the image does not expose as environment variables."""
+        return self.data_dir / "Saved" / "Config" / "WindowsServer" / "ServerSettings.ini"
+
+    @property
     def saves_root(self) -> Path:
-        """Racine archivée par les sauvegardes manuelles (parties + données joueurs)."""
+        """Root archived by manual backups (saves + player data)."""
         return self.data_dir / "Saved" / "PlayerData"
 
-    # Chemin des parties relatif à saves_root (aussi utilisé dans les archives).
+    # Path of the saves relative to saves_root (also used inside archives).
     prospects_rel = "DedicatedServer/Prospects"
 
     @property
@@ -136,7 +145,7 @@ class Config:
             raise ConfigError(f"Fuseau horaire inconnu : {tz_name}") from e
 
         restart_time = env.get("SCHEDULED_RESTART_TIME", "06:00").strip() or "06:00"
-        from .scheduler import parse_hhmm  # import local : évite un cycle au chargement
+        from .scheduler import parse_hhmm  # local import: avoids a cycle at load time
 
         try:
             parse_hhmm(restart_time)
@@ -160,7 +169,7 @@ class Config:
             a2s_port=_int(env, "A2S_PORT", 32784),
             panel_refresh_seconds=max(15, _int(env, "PANEL_REFRESH_SECONDS", 60)),
             player_poll_seconds=max(5, _int(env, "PLAYER_POLL_SECONDS", 20)),
-            stop_timeout=max(MIN_STOP_TIMEOUT, _int(env, "STOP_TIMEOUT", MIN_STOP_TIMEOUT)),
+            stop_timeout=max(MIN_STOP_TIMEOUT, _int(env, "STOP_TIMEOUT", DEFAULT_STOP_TIMEOUT)),
             recreate_timeout=max(60, _int(env, "RECREATE_TIMEOUT", 600)),
             timezone=tz,
             ntfy_url=env.get("NTFY_URL", "").strip().rstrip("/"),
@@ -169,6 +178,8 @@ class Config:
             log_patterns_file=Path(patterns_raw) if patterns_raw else None,
             log_dedupe_seconds=max(0, _int(env, "LOG_DEDUPE_SECONDS", 300)),
             log_max_per_minute=max(1, _int(env, "LOG_MAX_PER_MINUTE", 10)),
+            error_logs_to_discord=_bool(env, "ERROR_LOGS_TO_DISCORD", False),
+            log_spam_summary=_bool(env, "LOG_SPAM_SUMMARY", False),
             player_detection=detection,
             clean_exit_codes=_int_set(env, "CLEAN_EXIT_CODES", "0"),
             scheduled_restart_default_time=restart_time,

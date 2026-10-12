@@ -1,4 +1,4 @@
-"""Publication dans le salon logs (actions, alertes, lignes de logs) et sur ntfy."""
+"""Publishing to the logs channel (actions, alerts, log lines) and to ntfy."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import aiohttp
 import discord
 
 from . import ui
-from .antispam import AntiSpam
+from .antispam import AntiSpam, SummaryGate
 
 if TYPE_CHECKING:
     from .config import Config
@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-MAX_BLOCK = 1800  # caractères de logs par message (limite Discord confortable)
+MAX_BLOCK = 1800  # log characters per message (comfortable Discord limit)
 
 
 class Notifier:
@@ -27,11 +27,13 @@ class Notifier:
         self.config = config
         self.state = state
         self._session: aiohttp.ClientSession | None = None
-        # Lignes de logs : dédoublonnage + débit maximal par minute.
+        # Log lines: deduplication + maximum rate per minute.
         self.log_spam = AntiSpam(config.log_max_per_minute, 60.0, config.log_dedupe_seconds)
-        # Alertes (crash en boucle…) : 5 par 10 min, même type au plus toutes les 2 min.
+        # Dropped lines: at most one discreet summary per hour, and only if LOG_SPAM_SUMMARY.
+        self.log_spam_summary = SummaryGate(3600.0)
+        # Alerts (crash loop...): 5 per 10 min, same type at most every 2 min.
         self.alert_spam = AntiSpam(5, 600.0, 120.0)
-        # Refus de permission : évite qu'un clic répété inonde le salon.
+        # Permission denials: keeps repeated clicks from flooding the channel.
         self.denied_spam = AntiSpam(10, 600.0, 60.0)
         self._pending_lines: list[str] = []
         self._lines_lock = asyncio.Lock()
@@ -59,20 +61,20 @@ class Notifier:
         except discord.HTTPException as e:
             log.error("Échec d'envoi dans le salon logs : %s", e)
 
-    # --- journal des actions (qui a fait quoi) ---
+    # --- action log (who did what) ---
     async def action(self, user: discord.abc.User | str, action: str, result: str, color: int = ui.Colors.NEUTRAL) -> None:
-        who = user if isinstance(user, str) else f"{user.display_name} (`{user.id}`)"
+        who = user if isinstance(user, str) else f"{ui.md(user.display_name)} (`{user.id}`)"
         log.info("Action %s par %s : %s", action, who, result.replace("\n", " "))
         await self.post(f"👤 **{who}** — {action}\n\n{result}", color)
 
     async def denied(self, user: discord.abc.User, action: str) -> None:
         log.warning("Action refusée %s pour %s (%s)", action, user, user.id)
         if self.denied_spam.allow(f"{user.id}:{action}", key=f"{user.id}:{action}"):
-            await self.post(f"🚫 **{user.display_name}** (`{user.id}`) a tenté : {action} — refusé (rôle admin requis)")
+            await self.post(f"🚫 **{ui.md(user.display_name)}** (`{user.id}`) a tenté : {action} — refusé (rôle admin requis)")
 
-    # --- alertes ---
+    # --- alerts ---
     async def alert(self, category: str, title: str, body: str, color: int, priority: str = "default", tags: str = "") -> None:
-        """`category` : interrupteur concerné (crash, unexpected_restart, update)."""
+        """`category`: matching toggle (crash, unexpected_restart, update)."""
         if not self.state.alert_enabled(category):
             log.info("Alerte %s désactivée : %s", category, title)
             return
@@ -104,14 +106,14 @@ class Notifier:
         try:
             if self._session is None:
                 self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
-            # Publication JSON sur l'URL racine : pas de souci d'encodage des en-têtes (accents).
+            # JSON publish on the root URL: no header encoding issue (accents).
             async with self._session.post(self.config.ntfy_url, json=payload, headers=headers) as resp:
                 if resp.status >= 300:
                     log.error("ntfy a répondu %s : %s", resp.status, (await resp.text())[:200])
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.error("Échec de publication ntfy : %s", e)
 
-    # --- lignes de logs du conteneur (regroupées) ---
+    # --- container log lines (grouped) ---
     async def queue_log_line(self, line: str) -> None:
         if not self.log_spam.allow(line):
             return
@@ -122,8 +124,10 @@ class Notifier:
         async with self._lines_lock:
             lines, self._pending_lines = self._pending_lines, []
         suppressed = self.log_spam.pop_suppressed()
-        if not lines and not suppressed:
-            return
+        if suppressed:
+            log.debug("%d ligne(s) de logs écartée(s) par l'anti-spam", suppressed)
+            if self.config.log_spam_summary:
+                self.log_spam_summary.add(suppressed)
         chunks: list[str] = []
         current = ""
         for line in lines:
@@ -134,10 +138,8 @@ class Notifier:
             current += line + "\n"
         if current:
             chunks.append(current)
-        for i, chunk in enumerate(chunks):
-            text = f"📜 **Logs Icarus**\n```\n{chunk.rstrip()}\n```"
-            if suppressed and i == len(chunks) - 1:
-                text += f"\n-# {suppressed} ligne(s) ignorée(s) par l'anti-spam"
-            await self.post(text)
-        if suppressed and not chunks:
-            await self.post(f"-# 📜 {suppressed} ligne(s) de logs ignorée(s) par l'anti-spam")
+        for chunk in chunks:
+            await self.post(f"📜 **Logs Icarus**\n```\n{chunk.rstrip()}\n```")
+        summary = self.log_spam_summary.pop_due() if self.config.log_spam_summary else 0
+        if summary:
+            await self.post(f"-# 📜 {summary} ligne(s) de logs non publiée(s) par l'anti-spam au cours de la dernière heure")

@@ -31,11 +31,11 @@ def test_full_day_without_players():
     d = decide(at(5, 55), True, SIX, d.run, True, 0)
     assert d.action == Action.ANNOUNCE
     d = decide(at(5, 57), True, SIX, d.run, True, 0)
-    assert d.action == Action.NONE  # une seule annonce
+    assert d.action == Action.NONE  # a single announcement
     d = decide(at(6, 0), True, SIX, d.run, True, 0)
     assert d.action == Action.RESTART
     d = decide(at(6, 1), True, SIX, d.run, True, 0)
-    assert d.action == Action.NONE  # une seule fois par jour
+    assert d.action == Action.NONE  # only once per day
 
 
 def test_postpone_every_15_minutes_then_give_up():
@@ -53,7 +53,7 @@ def test_postpone_every_15_minutes_then_give_up():
         now = d.run.next_attempt
     assert d.action == Action.GIVE_UP
     assert now == at(8, 0)
-    assert attempts == 9  # 6:00, 6:15 … 8:00
+    assert attempts == 9  # 6:00, 6:15 ... 8:00
 
 
 def test_restart_when_players_leave():

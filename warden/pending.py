@@ -1,8 +1,8 @@
-"""Sélections en attente de confirmation, référencées par un jeton court dans les custom_id.
+"""Selections awaiting confirmation, referenced by a short token in the custom_ids.
 
-Les custom_id Discord sont limités à 100 caractères : on n'y met pas les noms de fichiers,
-seulement un jeton. Les jetons expirent (15 min, comme un token d'interaction) et sont
-perdus au redémarrage du bot — l'utilisateur recommence alors simplement la manipulation.
+Discord custom_ids are limited to 100 characters: file names are not put there, only a
+token. Tokens expire (15 min, like an interaction token) and are lost when the bot
+restarts; the user then simply starts over.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ class Pending:
         return token
 
     def get(self, token: str, user_id: int) -> dict[str, Any] | None:
-        """Données du jeton s'il existe, n'a pas expiré et appartient à cet utilisateur."""
+        """Token data if it exists, has not expired and belongs to this user."""
         self._purge()
         item = self._items.get(token)
         if item is None or item[1] != user_id:

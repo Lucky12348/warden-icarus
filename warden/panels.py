@@ -1,4 +1,4 @@
-"""Contenu des panneaux persistants (serveur, sauvegardes, réglages) et des réponses Infos/Stats."""
+"""Content of the persistent panels (server, backups, settings) and of the Info/Stats replies."""
 
 from __future__ import annotations
 
@@ -10,9 +10,9 @@ from . import settings_store as ss
 from .docker_ctl import ContainerStatus, Stats
 from .players import Snapshot, players_line
 from .state import ALERT_KEYS, ALERT_LABELS
-from .ui import ButtonSpec, Colors, MessageSpec, OptionSpec, SelectSpec, fmt_bytes, fmt_duration, fmt_dt, message
+from .ui import ButtonSpec, Colors, MessageSpec, OptionSpec, SelectSpec, fmt_bytes, fmt_duration, fmt_dt, md, message
 
-STARTUP_GRACE = timedelta(minutes=15)  # mise à jour + chargement du monde au démarrage
+STARTUP_GRACE = timedelta(minutes=15)  # update + world loading at start-up
 
 
 @dataclass(frozen=True)
@@ -67,7 +67,7 @@ def server_panel(info: ServerInfo) -> MessageSpec:
     line, color = status_line(info)
     running = info.status.running and not info.operation
     busy = info.operation is not None
-    body = [f"# 🎮 {info.server_name}", line]
+    body = [f"# 🎮 {md(info.server_name)}", line]
     if info.status.running:
         body.append(players_line(info.players))
         body.append(resources_line(info.stats))
@@ -76,13 +76,13 @@ def server_panel(info: ServerInfo) -> MessageSpec:
         text += f"\n⏰ Redémarrage planifié à **{info.scheduled_time}** (reporté si des joueurs sont connectés)"
     text += (
         f"\n\n-# Actualisé à {info.now.astimezone(info.tz):%H:%M} · toutes les {info.refresh_seconds} s"
-        " · « Mettre à jour » = redémarrage : l'image installe la dernière version au démarrage."
+        " · L'image met Icarus à jour seule quand le serveur est vide ; « Mettre à jour » force une réinstallation."
     )
     buttons = (
         ButtonSpec("Démarrer", "wi:srv:start", "success", disabled=busy or info.status.running, emoji="▶️"),
         ButtonSpec("Arrêter", "wi:srv:stop", "danger", disabled=busy or not running, emoji="⏹️"),
         ButtonSpec("Redémarrer", "wi:srv:restart", "primary", disabled=busy or not running, emoji="🔁"),
-        ButtonSpec("Mettre à jour", "wi:srv:update", "secondary", disabled=busy or not info.status.exists, emoji="⬆️"),
+        ButtonSpec("Mettre à jour", "wi:srv:update", "secondary", disabled=busy or not running, emoji="⬆️"),
         ButtonSpec("Infos", "wi:srv:info", "secondary", emoji="ℹ️"),
     )
     return message(text, color, buttons)
@@ -91,7 +91,7 @@ def server_panel(info: ServerInfo) -> MessageSpec:
 def info_text(info: ServerInfo, game_port: str, query_port: int) -> str:
     st = info.status
     line, _ = status_line(info)
-    lines = [f"# ℹ️ {info.server_name}", line]
+    lines = [f"# ℹ️ {md(info.server_name)}", line]
     if st.running:
         lines.append(players_line(info.players))
         lines.append(resources_line(info.stats))
@@ -130,13 +130,13 @@ def stats_text(info: ServerInfo, disk: tuple[int, int, int] | None, backups_size
     return "\n".join(lines)
 
 
-# --------------------------------------------------------------------------- sauvegardes
+# --------------------------------------------------------------------------- backups
 def backups_panel(prospects: list[bk.Prospect], archives: list[tuple[str, datetime, int]], retention: int, tz: tzinfo) -> MessageSpec:
     lines = ["# 📦 Sauvegardes", ""]
     if prospects:
         lines.append(f"**Parties** ({len(prospects)})")
         for p in prospects[:10]:
-            lines.append(f"• **{p.name}** — modifiée le {fmt_dt(p.modified, tz)} · {bk.human_size(p.size)}")
+            lines.append(f"• **{md(p.name)}** — modifiée le {fmt_dt(p.modified, tz)} · {bk.human_size(p.size)}")
         if len(prospects) > 10:
             lines.append(f"-# … et {len(prospects) - 10} autre(s)")
     else:
@@ -172,7 +172,7 @@ def restore_point_label(point: bk.RestorePoint, tz: tzinfo) -> OptionSpec:
     return OptionSpec(label, point.token, f"{fmt_dt(point.modified, tz)} • {bk.human_size(point.size)} • {point.ref}")
 
 
-# --------------------------------------------------------------------------- réglages
+# --------------------------------------------------------------------------- settings
 @dataclass(frozen=True)
 class SettingsInfo:
     alerts: dict[str, bool]
@@ -184,6 +184,13 @@ class SettingsInfo:
     editable: set[str]
     pending: set[str]
     env_readable: bool
+    ini_readable: bool = True
+
+
+SCHEDULED_RESTART_WARNING = (
+    "⚠️ L'image gère déjà les mises à jour (UPDATE_CRON, quand le serveur est vide) : "
+    "ce redémarrage quotidien n'est plus nécessaire."
+)
 
 
 def settings_panel(info: SettingsInfo) -> MessageSpec:
@@ -209,14 +216,21 @@ def settings_panel(info: SettingsInfo) -> MessageSpec:
     lines = []
     if not info.env_readable:
         lines.append("⚠️ Impossible de lire le `.env` d'Icarus.")
+    if not info.ini_readable:
+        lines.append("⚠️ `ServerSettings.ini` introuvable ou illisible (créé par l'image au premier démarrage).")
     for defn in ss.SETTINGS:
         marker = ""
         if defn.key not in info.editable:
             marker = " 🔒"
         elif defn.key in info.pending:
             marker = " ⏳"
-        lines.append(f"**{defn.label}** : {ss.display_value(defn, info.env_values.get(defn.key))}{marker}")
-    legend = "-# ⏳ modifié, appliqué à la prochaine recréation du conteneur"
+        elif defn.storage == "ini":
+            marker = " 📄"
+        lines.append(f"**{defn.label}** : {md(ss.display_value(defn, info.env_values.get(defn.key)))}{marker}")
+    legend = (
+        "-# ⏳ modifié, appliqué à la prochaine recréation du conteneur"
+        " · 📄 réglage de `ServerSettings.ini` (appliqué par un redémarrage du serveur)"
+    )
     if any(d.key not in info.editable for d in ss.SETTINGS):
         legend += " · 🔒 écrit en dur dans docker-compose.yml (non modifiable ici)"
 
@@ -230,7 +244,7 @@ def settings_panel(info: SettingsInfo) -> MessageSpec:
         "## 🔔 Alertes\nVert = activé. « Alertes Discord » et « ntfy » choisissent la destination ; "
         "les autres choisissent les événements signalés.",
         alert_buttons,
-        f"## ⏰ Redémarrage planifié\n{sched}",
+        f"## ⏰ Redémarrage planifié\n{sched}\n{SCHEDULED_RESTART_WARNING}",
         sched_buttons,
         "## 🧊 Serveur Icarus\n" + "\n".join(lines) + "\n" + legend,
     ]

@@ -1,4 +1,4 @@
-# Binaires statiques du client Docker et du plugin compose (pour recréer le conteneur Icarus).
+# Static binaries of the Docker client and the compose plugin (to recreate the Icarus container).
 FROM docker:29-cli AS dockercli
 
 FROM python:3.12-slim
@@ -16,8 +16,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY warden ./warden
 
-# Jamais root : uid 1000 (propriétaire des fichiers d'Icarus) ; l'accès au socket Docker
-# passe par le groupe docker de l'hôte (group_add dans docker-compose.yml).
+# Never root: uid 1000 (owner of the Icarus files); access to the Docker socket
+# goes through the host's docker group (group_add in docker-compose.yml).
 USER 1000:1000
 
 HEALTHCHECK --interval=60s --timeout=5s --start-period=180s --retries=3 \
