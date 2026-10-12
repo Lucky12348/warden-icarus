@@ -246,11 +246,14 @@ def parse_ini_section(text: str, section: str = INI_SECTION) -> dict[str, str]:
     return values
 
 
-def read_ini(path: Path, section: str = INI_SECTION) -> dict[str, str]:
-    """Read the section; the file is in data/ (writable by the game): no link followed."""
-    if not os.path.lexists(path):
+def read_ini(path: Path, section: str = INI_SECTION, root: Path | None = None) -> dict[str, str]:
+    """Read the section; the file is in data/ (writable by the game): no link followed.
+
+    `root`: data/, from which the folders are walked without following links (see safefs).
+    """
+    if not safefs.lexists(path, root):
         return {}
-    return parse_ini_section(_decode_ini(safefs.read_bytes(path, safefs.SMALL_FILE)[0])[0], section)
+    return parse_ini_section(_decode_ini(safefs.read_bytes(path, safefs.SMALL_FILE, root)[0])[0], section)
 
 
 def ini_lookup(values: Mapping[str, str], key: str) -> str | None:
@@ -303,19 +306,17 @@ def write_ini(path: Path, changes: Mapping[str, str], section: str = INI_SECTION
     encoding and line endings as the original. Return the path of the .bak.
 
     The folder is writable by the game: neither the original, nor the .bak, nor the temporary
-    file is handled through a symlink (see safefs). `root`: root the real folder must not
-    leave.
+    file is handled through a symlink (see safefs). `root`: data/, from which the folders are
+    walked without following links.
     """
-    if root is not None:
-        safefs.ensure_inside(path, root)
-    if not os.path.lexists(path):
+    if not safefs.lexists(path, root):
         raise SettingError(f"{path.name} introuvable : démarre le serveur une fois pour que l'image le crée.")
-    raw, mode = safefs.read_bytes(path, safefs.SMALL_FILE)
+    raw, mode = safefs.read_bytes(path, safefs.SMALL_FILE, root)
     text, encoding = _decode_ini(raw)
     new_text = update_ini_text(text, changes, section)
     backup = path.with_name(path.name + ".bak")
-    safefs.atomic_write(backup, raw, mode)
-    safefs.atomic_write(path, new_text.encode(encoding), mode)
+    safefs.atomic_write(backup, raw, mode, root)
+    safefs.atomic_write(path, new_text.encode(encoding), mode, root)
     return backup
 
 

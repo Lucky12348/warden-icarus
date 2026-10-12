@@ -53,14 +53,23 @@ def status_line(info: ServerInfo) -> tuple[str, int]:
     return f"⚪ **Arrêté**{code}", Colors.NEUTRAL
 
 
+def cores_label(count: int | None) -> str | None:
+    """"4 cœurs" (number of cores of the VM), or None if unknown."""
+    if not count:
+        return None
+    return f"{count} cœur{'s' if count > 1 else ''}"
+
+
 def resources_line(stats: Stats | None) -> str:
+    """CPU as a % of the whole VM (comparable to Proxmox), RAM of the container without cache."""
     if stats is None:
-        return "🖥️ CPU — · RAM —"
+        return "🖥️ CPU — · RAM Icarus —"
     cpu = "—" if stats.cpu_percent is None else f"{stats.cpu_percent:.0f} %"
     ram = fmt_bytes(stats.mem_used)
     if stats.mem_limit:
         ram += f" / {fmt_bytes(stats.mem_limit)}"
-    return f"🖥️ CPU **{cpu}** · RAM **{ram}**"
+    cores = cores_label(stats.cpu_count)
+    return f"🖥️ CPU **{cpu}**{f' ({cores})' if cores else ''} · RAM Icarus **{ram}**"
 
 
 def server_panel(info: ServerInfo) -> MessageSpec:
@@ -117,10 +126,12 @@ def stats_text(info: ServerInfo, disk: tuple[int, int, int] | None, backups_size
     lines = ["# 📊 Statistiques", status_line(info)[0]]
     if info.stats and info.status.running:
         if info.stats.cpu_percent is not None:
-            lines.append(f"**CPU (conteneur)** : {progress_bar(info.stats.cpu_percent)}")
+            cores = cores_label(info.stats.cpu_count)
+            title = f"CPU (VM, {cores})" if cores else "CPU (VM)"
+            lines.append(f"**{title}** : {progress_bar(info.stats.cpu_percent)}")
         if info.stats.mem_used is not None and info.stats.mem_limit:
             pct = info.stats.mem_used / info.stats.mem_limit * 100
-            lines.append(f"**RAM** : {progress_bar(pct)} — {fmt_bytes(info.stats.mem_used)} / {fmt_bytes(info.stats.mem_limit)}")
+            lines.append(f"**RAM Icarus** : {progress_bar(pct)} — {fmt_bytes(info.stats.mem_used)} / {fmt_bytes(info.stats.mem_limit)}")
     if info.status.running:
         lines.append(players_line(info.players))
     if disk:
@@ -157,6 +168,7 @@ def backups_panel(prospects: list[bk.Prospect], archives: list[tuple[str, dateti
     buttons = (
         ButtonSpec("Sauvegarder maintenant", "wi:bak:create", "primary", emoji="💾"),
         ButtonSpec("Restaurer…", "wi:bak:restore", "danger", emoji="♻️"),
+        ButtonSpec("Télécharger", "wi:bak:download", "secondary", emoji="📥"),
         ButtonSpec("Actualiser", "wi:bak:refresh", "secondary", emoji="🔄"),
     )
     return message("\n".join(lines), Colors.BRAND, buttons)

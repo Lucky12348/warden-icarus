@@ -19,6 +19,7 @@ import os
 import re
 import tarfile
 import time
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
 from pathlib import Path, PurePosixPath
@@ -174,11 +175,13 @@ def list_restore_points(
     return sorted(points, key=lambda p: p.modified, reverse=True)
 
 
-def _read_valid_json(path: Path, attempts: int = 3, delay: float = 1.0) -> tuple[bytes, bool]:
+def _read_valid_json(
+    path: Path, attempts: int = 3, delay: float = 1.0, root: Path | None = None
+) -> tuple[bytes, bool]:
     """Read a JSON file; retry if the game is still writing it."""
     data = b""
     for i in range(attempts):
-        data = safefs.read_bytes(path, safefs.SAVE_FILE)[0]
+        data = safefs.read_bytes(path, safefs.SAVE_FILE, root)[0]
         try:
             json.loads(data)
             return data, True
@@ -186,6 +189,54 @@ def _read_valid_json(path: Path, attempts: int = 3, delay: float = 1.0) -> tuple
             if i < attempts - 1:
                 time.sleep(delay)
     return data, False
+
+
+@dataclass(frozen=True)
+class Export:
+    filename: str  # e.g. icarus-Olympus-20261012-180000.zip
+    data: bytes  # zip containing <prospect>.json
+    json_size: int
+    valid: bool  # False: the game was still writing the save (exported as is)
+
+
+def _safe_filename(name: str) -> str:
+    """File name usable on every OS (save names are chosen in game)."""
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_")
+    return cleaned[:60] or "map"
+
+
+def export_prospect(
+    prospects_dir: Path, prospect: str, now: datetime, root: Path | None = None, json_retry_delay: float = 1.0
+) -> Export:
+    """Zip of the current `<prospect>.json`, to download from Discord.
+
+    Read-only: no symlink followed, real folder under `root` (data/) when given. The save is
+    re-read until it is valid JSON, so it can be exported with the server running.
+    """
+    check_name(prospect)
+    path = prospects_dir / f"{prospect}.json"
+    try:
+        if not safefs.lexists(path, root):
+            raise BackupError(f"Partie introuvable : {prospect}")
+        data, valid = _read_valid_json(path, delay=json_retry_delay, root=root)
+    except safefs.UnsafePathError as e:
+        raise BackupError(str(e)) from None
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        info = zipfile.ZipInfo(f"{prospect}.json", date_time=now.timetuple()[:6])
+        info.compress_type = zipfile.ZIP_DEFLATED
+        info.external_attr = 0o644 << 16
+        zf.writestr(info, data)
+    stamp = now.strftime("%Y%m%d-%H%M%S")
+    return Export(f"icarus-{_safe_filename(prospect)}-{stamp}.zip", buffer.getvalue(), len(data), valid)
+
+
+def split_parts(data: bytes, part_size: int) -> list[bytes]:
+    """Cut `data` into consecutive parts of at most `part_size` bytes (raw split: the parts
+    concatenated give the original file back, as 7-Zip does with `.zip.001`, `.zip.002`...)."""
+    if part_size < 1:
+        raise ValueError("part_size must be >= 1")
+    return [data[i:i + part_size] for i in range(0, len(data), part_size)] or [b""]
 
 
 def _unique_archive_path(backup_dir: Path, now: datetime) -> Path:
@@ -241,7 +292,7 @@ def create_archive(
                     continue
                 arcname = path.relative_to(saves_root).as_posix()
                 if path.suffix == ".json":
-                    data, valid = _read_valid_json(path, delay=json_retry_delay)
+                    data, valid = _read_valid_json(path, delay=json_retry_delay, root=root)
                     if not valid:
                         warnings.append(f"{arcname} n'est pas un JSON valide (archivé tel quel)")
                     info = tarfile.TarInfo(arcname)
@@ -276,17 +327,18 @@ def apply_retention(backup_dir: Path, keep: int) -> list[Path]:
 
 
 def _load_restore_data(
-    prospects_dir: Path, backup_dir: Path, prospect: str, source: str, ref: str, prospects_rel: str
+    prospects_dir: Path, backup_dir: Path, prospect: str, source: str, ref: str, prospects_rel: str,
+    root: Path | None = None,
 ) -> bytes:
     check_name(ref)
     if source == "game":
         if not (ref.startswith(f"{prospect}.json.backup") or ref.startswith(f"{prospect}.json.pre_restore_")):
             raise BackupError(f"{ref} n'est pas une sauvegarde de {prospect}")
         path = prospects_dir / ref
-        if not os.path.lexists(path):
-            raise BackupError(f"Sauvegarde introuvable : {ref}")
         try:
-            return safefs.read_bytes(path, safefs.SAVE_FILE)[0]  # never through a link (folder writable by the game)
+            if not safefs.lexists(path, root):
+                raise BackupError(f"Sauvegarde introuvable : {ref}")
+            return safefs.read_bytes(path, safefs.SAVE_FILE, root)[0]  # never through a link (folder writable by the game)
         except safefs.UnsafePathError as e:
             raise BackupError(str(e)) from None
     if source == "archive":
@@ -328,7 +380,7 @@ def restore_prospect(
     the real folder must stay under `root` (data/) when given.
     """
     check_name(prospect)
-    data = _load_restore_data(prospects_dir, backup_dir, prospect, source, ref, prospects_rel)
+    data = _load_restore_data(prospects_dir, backup_dir, prospect, source, ref, prospects_rel, root)
     try:
         json.loads(data)
     except ValueError:
@@ -337,15 +389,13 @@ def restore_prospect(
     prospects_dir.mkdir(parents=True, exist_ok=True)
     target = prospects_dir / f"{prospect}.json"
     try:
-        if root is not None:
-            safefs.ensure_inside(target, root)
         mode = 0o644
         pre_restore = None
-        if os.path.lexists(target):
-            current, mode = safefs.read_bytes(target, safefs.SAVE_FILE)
+        if safefs.lexists(target, root):
+            current, mode = safefs.read_bytes(target, safefs.SAVE_FILE, root)
             pre_restore = target.with_name(f"{target.name}.pre_restore_{now.strftime('%Y%m%d-%H%M%S')}")
-            safefs.atomic_write(pre_restore, current, mode)
-        safefs.atomic_write(target, data, mode)
+            safefs.atomic_write(pre_restore, current, mode, root)
+        safefs.atomic_write(target, data, mode, root)
     except safefs.UnsafePathError as e:
         raise BackupError(f"{e} — restauration annulée, rien n'a été modifié") from None
     return RestoreResult(target, pre_restore)

@@ -6,7 +6,7 @@ from datetime import timezone
 import pytest
 
 from warden.config import MIN_STOP_TIMEOUT, Config, ConfigError
-from warden.docker_ctl import compute_cpu_percent, compute_memory, parse_docker_time, read_buildid
+from warden.docker_ctl import compute_cpu, compute_memory, parse_docker_time, read_buildid
 from warden.logpatterns import LogPatterns
 from warden.pending import Pending
 from warden.state import State
@@ -53,15 +53,45 @@ def test_parse_docker_time():
     assert parse_docker_time("2026-10-02T06:00:03+02:00").utcoffset().total_seconds() == 7200
 
 
-def test_cpu_and_memory():
-    stats = {
-        "cpu_stats": {"cpu_usage": {"total_usage": 3_000}, "system_cpu_usage": 20_000, "online_cpus": 4},
-        "precpu_stats": {"cpu_usage": {"total_usage": 1_000}, "system_cpu_usage": 10_000},
-        "memory_stats": {"usage": 1_000, "limit": 4_000, "stats": {"inactive_file": 200}},
-    }
-    assert compute_cpu_percent(stats) == pytest.approx(80.0)
+def cpu_stats(container_delta, system_delta, online_cpus=None, percpu=None):
+    usage = {"total_usage": 1_000 + container_delta}
+    if percpu is not None:
+        usage["percpu_usage"] = percpu
+    cpu = {"cpu_usage": usage, "system_cpu_usage": 10_000 + system_delta}
+    if online_cpus is not None:
+        cpu["online_cpus"] = online_cpus
+    return {"cpu_stats": cpu, "precpu_stats": {"cpu_usage": {"total_usage": 1_000}, "system_cpu_usage": 10_000}}
+
+
+def test_cpu_is_a_percentage_of_the_whole_vm():
+    # docker stats would show 15 % (of one core) on 4 cores: Proxmox shows 3.75 % of the VM.
+    percent, cores = compute_cpu(cpu_stats(375, 10_000, online_cpus=4))
+    assert percent == pytest.approx(3.75) and cores == 4
+    # Without online_cpus: the number of cores comes from percpu_usage.
+    assert compute_cpu(cpu_stats(2_000, 10_000, percpu=[1, 2])) == (pytest.approx(20.0), 2)
+    # Never above 100 % of the VM, idle or invalid counters give 0 %, missing data gives None.
+    assert compute_cpu(cpu_stats(20_000, 10_000, online_cpus=4))[0] == 100.0
+    assert compute_cpu(cpu_stats(0, 0, online_cpus=4)) == (0.0, 4)
+    assert compute_cpu({}) == (None, None)
+
+
+def test_memory_excludes_cache():
+    stats = {"memory_stats": {"usage": 1_000, "limit": 4_000, "stats": {"inactive_file": 200}}}
     assert compute_memory(stats) == (800, 4_000)
-    assert compute_cpu_percent({}) is None
+    cgroup_v1 = {"memory_stats": {"usage": 1_000, "limit": 4_000, "stats": {"total_inactive_file": 300}}}
+    assert compute_memory(cgroup_v1) == (700, 4_000)
+    assert compute_memory({}) == (None, None)
+
+
+def test_resources_line_format():
+    from warden.docker_ctl import Stats
+    from warden.panels import resources_line
+
+    gib = 1024**3
+    line = resources_line(Stats(3.75, int(1.2 * gib), int(7.7 * gib), 4))
+    assert line == "🖥️ CPU **4 %** (4 cœurs) · RAM Icarus **1,2 Go / 7,7 Go**"
+    assert resources_line(Stats(50.0, None, None, 1)) == "🖥️ CPU **50 %** (1 cœur) · RAM Icarus **?**"
+    assert resources_line(Stats(None, None, None)) == "🖥️ CPU **—** · RAM Icarus **?**"
 
 
 def test_read_buildid(tmp_path):

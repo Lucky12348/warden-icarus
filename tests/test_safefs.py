@@ -184,3 +184,41 @@ def test_endless_log_line_is_cut(tmp_path):
     client.containers = client
     lines = list(IcarusDocker("icarus", tmp_path, client).logs(since=0))
     assert lines == ["y" * MAX_LOG_LINE, "fin"]
+
+
+def test_swapped_parent_folder_cannot_redirect_writes(tmp_path, victim):
+    """A folder of data/ replaced by a link (even after any check) never redirects a write."""
+    data = tmp_path / "data"
+    data.mkdir()
+    outside = victim.parent / "state"
+    outside.mkdir()
+    symlink(data / "Saved", outside, is_dir=True)
+    target = data / "Saved" / "state.json"
+    with pytest.raises(safefs.UnsafePathError):
+        safefs.atomic_write(target, b'{"pwned": true}', root=data)
+    with pytest.raises(safefs.UnsafePathError):
+        safefs.read_bytes(target, root=data)
+    assert list(outside.iterdir()) == []
+
+
+def test_root_relative_helpers_without_links(tmp_path):
+    data = tmp_path / "data"
+    (data / "Saved").mkdir(parents=True)
+    target = data / "Saved" / "x.json"
+    assert not safefs.lexists(target, data)
+    safefs.atomic_write(target, b"{}", 0o640, root=data)
+    assert safefs.lexists(target, data)
+    assert safefs.read_bytes(target, root=data)[0] == b"{}"
+    assert [p.name for p in (data / "Saved").iterdir()] == ["x.json"]  # no temporary file left
+    with pytest.raises(safefs.UnsafePathError):
+        safefs.atomic_write(tmp_path / "ailleurs.json", b"{}", root=data)
+
+
+def test_linux_uses_directory_descriptors():
+    """On Linux the race-free path must really be active (not silently the fallback)."""
+    import os
+    import sys
+
+    if not sys.platform.startswith("linux"):
+        pytest.skip("directory descriptors: Linux only")
+    assert safefs.DIR_FD_SUPPORTED, {f.__name__: f in os.supports_dir_fd for f in (os.open, os.stat, os.unlink, os.rename)}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -17,6 +18,8 @@ from .ui import Colors, respond, update
 if TYPE_CHECKING:
     from .bot import WardenBot
 
+log = logging.getLogger(__name__)
+
 LOGS_MAX_LINES = 2000
 MESSAGE_LIMIT = 2000  # characters in a Discord message
 
@@ -28,6 +31,16 @@ def format_logs(lines: list[str]) -> str | None:
     body = "\n".join(lines).replace("```", "'''")
     text = f"```\n{body}\n```"
     return text if len(text) <= MESSAGE_LIMIT else None
+
+
+def logs_file(lines: list[str], max_bytes: int) -> tuple[bytes, int]:
+    """UTF-8 .txt content of at most `max_bytes`, keeping the most recent lines. Return (content, kept)."""
+    encoded = [(line + "\n").encode("utf-8") for line in lines]
+    total, start = 0, len(encoded)
+    while start > 0 and total + len(encoded[start - 1]) <= max_bytes:
+        start -= 1
+        total += len(encoded[start])
+    return b"".join(encoded[start:]), len(encoded) - start
 
 
 def setup(bot: "WardenBot") -> None:
@@ -96,17 +109,23 @@ def setup(bot: "WardenBot") -> None:
         except Exception as e:  # noqa: BLE001 - DockerError, APIError...
             await interaction.followup.send(f"❌ Logs indisponibles : {e}", ephemeral=True)
             return
-        text = format_logs(lines)
-        if text is not None:
-            await interaction.followup.send(text, ephemeral=True)
-        else:
+        try:
+            text = format_logs(lines)
+            if text is not None:
+                await interaction.followup.send(text, ephemeral=True)
+                return
+            limit = (interaction.guild.filesize_limit if interaction.guild else 10 * 1024 * 1024) - 64 * 1024
+            payload, kept = logs_file(lines, limit)
             stamp = datetime.now(bot.config.timezone).strftime("%Y%m%d-%H%M%S")
-            payload = io.BytesIO(("\n".join(lines) + "\n").encode("utf-8"))
+            note = "" if kept == len(lines) else f" (les {len(lines) - kept} plus anciennes retirées : limite d'envoi Discord)"
             await interaction.followup.send(
-                f"📜 {len(lines)} dernière(s) ligne(s) de `{bot.config.container_name}`",
-                file=discord.File(payload, filename=f"icarus-logs-{stamp}.txt"),
+                f"📜 {kept} dernière(s) ligne(s) de `{bot.config.container_name}`{note}",
+                file=discord.File(io.BytesIO(payload), filename=f"icarus-logs-{stamp}.txt"),
                 ephemeral=True,
             )
+        except discord.HTTPException as e:
+            log.exception("Sending /logs failed")
+            await interaction.followup.send(f"❌ Envoi impossible : {e}", ephemeral=True)
 
     @tree.command(name="panneaux", description="Republier / rafraîchir les panneaux (admin)", guild=guild)
     async def panneaux(interaction: discord.Interaction) -> None:

@@ -19,6 +19,7 @@ from . import __version__
 from . import backups as bk
 from . import players as pl
 from . import scheduler as sch
+from . import safefs
 from . import settings_store as ss
 from . import ui
 from .config import Config
@@ -43,6 +44,7 @@ HEARTBEAT_FILE = Path("/tmp/warden-heartbeat")
 INVITE_PERMISSIONS = 199680  # View channels, Send, Read history, Mention roles
 # A "fully installed" line is published if the build changed in the last 10 minutes.
 UPDATE_LINE_WINDOW = 600.0
+STATS_CACHE_SECONDS = 10.0  # docker stats shared by the panel, Info, /statut and /stats
 
 
 class Busy(Exception):
@@ -70,6 +72,8 @@ class WardenBot(discord.Client):
         self._panel_locks: dict[str, asyncio.Lock] = {}
         self._schedule_run: sch.Run | None = None
         self._build_changed_at: float | None = None
+        self._stats_lock = asyncio.Lock()
+        self._stats_cache: tuple[float, Stats | None] | None = None
         self._presence: str | None = None
         self._started = False
         self._closing = threading.Event()
@@ -246,12 +250,7 @@ class WardenBot(discord.Client):
     # ================================================================== information
     async def server_info(self, with_stats: bool = True) -> ServerInfo:
         status: ContainerStatus = await asyncio.to_thread(self.docker.status)
-        stats: Stats | None = None
-        if with_stats and status.running:
-            try:
-                stats = await asyncio.to_thread(self.docker.stats)
-            except Exception as e:  # noqa: BLE001
-                log.debug("docker stats indisponible : %s", e)
+        stats = await self._cached_stats() if with_stats and status.running else None
         players = self.players if status.running else None
         name = (
             (players.server_name if players else None)
@@ -273,6 +272,24 @@ class WardenBot(discord.Client):
             buildid=await asyncio.to_thread(read_buildid, self.config.game_dir),
         )
 
+    async def _cached_stats(self) -> Stats | None:
+        """`docker stats` (about 2 s, blocks a worker thread), at most once every STATS_CACHE_SECONDS.
+
+        Info, /statut and /stats are open to every member: without this, repeated clicks would
+        stack calls and could saturate the thread pool used for every Docker operation.
+        """
+        async with self._stats_lock:
+            cached = self._stats_cache
+            if cached is not None and time.monotonic() - cached[0] < STATS_CACHE_SECONDS:
+                return cached[1]
+            try:
+                stats: Stats | None = await asyncio.to_thread(self.docker.stats)
+            except Exception as e:  # noqa: BLE001
+                log.debug("docker stats unavailable: %s", e)
+                stats = None
+            self._stats_cache = (time.monotonic(), stats)
+            return stats
+
     def _read_compose(self) -> str:
         try:
             return self.config.icarus_compose_file.read_text(encoding="utf-8")
@@ -288,7 +305,8 @@ class WardenBot(discord.Client):
                 log.warning(".env d'Icarus illisible : %s", e)
                 env, env_ok = {}, False
             try:
-                ini, ini_ok = ss.read_ini(self.config.server_settings_file), self.config.server_settings_file.exists()
+                ini_file, data_dir = self.config.server_settings_file, self.config.data_dir
+                ini, ini_ok = ss.read_ini(ini_file, root=data_dir), safefs.lexists(ini_file, data_dir)
             except (OSError, UnicodeError) as e:
                 log.warning("ServerSettings.ini illisible : %s", e)
                 ini, ini_ok = {}, False

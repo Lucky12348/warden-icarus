@@ -8,6 +8,7 @@ everything else requires the admin role, checked at every step (confirmation inc
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 from datetime import datetime
 from typing import TYPE_CHECKING, Callable
@@ -32,6 +33,11 @@ SERVER_ACTIONS = {
     "restart": ("redémarrage", "Redémarrer"),
     "update": ("mise à jour forcée", "Mettre à jour"),
 }
+
+DEFAULT_UPLOAD_LIMIT = 10 * 1024 * 1024  # bot upload limit on a server without boost
+UPLOAD_MARGIN = 64 * 1024  # room for the request overhead
+MAX_UPLOAD_PARTS = 10
+
 
 def _cancel(zone: str) -> ButtonSpec:
     return ButtonSpec("Annuler", f"wi:{zone}:cancel", "secondary")
@@ -137,13 +143,18 @@ async def run_server_action(bot: "WardenBot", interaction: discord.Interaction, 
 async def backups_component(bot: "WardenBot", interaction: discord.Interaction, action: str, arg: str) -> None:
     if action == "refresh":
         await interaction.response.defer()  # click on the panel: plain acknowledgement
-        await bot.refresh_backups_panel(force=True)
+        # Open to everyone: the message is only edited if its content changed (no edit flood).
+        await bot.refresh_backups_panel()
         return
     if action == "cancel":
         await update(interaction, "❎ Annulé.", Colors.NEUTRAL)
         return
     if action == "create":
         await create_backup(bot, interaction)
+        return
+    if action in ("download", "dlpick"):
+        if await bot.require_admin(interaction, "téléchargement d'une map"):
+            await (_download_pick(bot, interaction) if action == "download" else _download_selected(bot, interaction))
         return
     if not await bot.require_admin(interaction, "restauration de sauvegarde"):
         return
@@ -174,7 +185,7 @@ async def create_backup(bot: "WardenBot", interaction: discord.Interaction) -> N
         return
     except Exception as e:  # noqa: BLE001
         log.exception("Échec de la sauvegarde")
-        text = f"❌ Sauvegarde impossible : {e}"
+        text = f"❌ Sauvegarde impossible : {md(e)}"
         await update(interaction, text, Colors.DANGER)
         await bot.notifier.action(interaction.user, "Sauvegarde manuelle", text, Colors.DANGER)
         return
@@ -185,10 +196,92 @@ async def create_backup(bot: "WardenBot", interaction: discord.Interaction) -> N
     if removed:
         text += f"\nRétention ({cfg.backup_retention}) : {len(removed)} ancienne(s) archive(s) supprimée(s)."
     for warning in result.warnings:
-        text += f"\n⚠️ {warning}"
+        text += f"\n⚠️ {md(warning)}"  # contains file names chosen in game
     await update(interaction, text, Colors.SUCCESS)
     await bot.notifier.action(interaction.user, "Sauvegarde manuelle", text, Colors.SUCCESS)
     await bot.refresh_backups_panel(force=True)
+
+
+async def _download_pick(bot: "WardenBot", interaction: discord.Interaction) -> None:
+    """Download button: a single map is sent straight away, otherwise the admin picks it."""
+    prospects = await asyncio.to_thread(bk.list_prospects, bot.config.prospects_dir, bot.config.timezone)
+    if not prospects:
+        await respond(interaction, "⚠️ Aucune partie trouvée dans le dossier des sauvegardes.", Colors.DANGER)
+        return
+    if len(prospects) == 1:
+        await respond(interaction, f"⏳ Préparation de **{md(prospects[0].name)}**…", Colors.WARNING)
+        await _send_map(bot, interaction, prospects[0].name)
+        return
+    from .ui import fmt_dt
+
+    options = tuple(
+        OptionSpec(p.name, p.name, f"Modifiée le {fmt_dt(p.modified, bot.config.timezone)} • {bk.human_size(p.size)}")
+        for p in prospects[:25]
+        if len(p.name) <= 100
+    )
+    await respond(
+        interaction,
+        "# 📥 Télécharger une map\n\nChoisis la **partie** : le fichier t'est envoyé ici, visible par toi seul.",
+        Colors.BRAND,
+        (SelectSpec("wi:bak:dlpick", "Choisir une partie…", options),),
+        (_cancel("bak"),),
+    )
+
+
+async def _download_selected(bot: "WardenBot", interaction: discord.Interaction) -> None:
+    values = _values(interaction)
+    if not values:
+        return
+    await update(interaction, f"⏳ Préparation de **{md(values[0])}**…", Colors.WARNING)
+    await _send_map(bot, interaction, values[0])
+
+
+async def _send_map(bot: "WardenBot", interaction: discord.Interaction, prospect: str) -> None:
+    """Zip the map and send it privately (ephemeral); split into parts if above the server limit."""
+    cfg = bot.config
+    action = f"Téléchargement — {md(prospect)}"
+    try:
+        export = await asyncio.to_thread(
+            bk.export_prospect, cfg.prospects_dir, prospect, datetime.now(cfg.timezone), root=cfg.data_dir
+        )
+    except (bk.BackupError, OSError) as e:
+        log.warning("Export of %s impossible: %s", prospect, e)
+        await update(interaction, f"❌ Téléchargement impossible : {md(e)}", Colors.DANGER)
+        return
+    guild_limit = interaction.guild.filesize_limit if interaction.guild else DEFAULT_UPLOAD_LIMIT
+    part_size = max(1024 * 1024, guild_limit - UPLOAD_MARGIN)
+    parts = bk.split_parts(export.data, part_size)
+    if len(parts) > MAX_UPLOAD_PARTS:
+        text = (
+            f"❌ **{md(prospect)}** fait {bk.human_size(len(export.data))} une fois compressée : trop gros pour Discord "
+            f"(limite du serveur : {bk.human_size(guild_limit)} par fichier).\n"
+            f"Récupère-la depuis la VM : `{code(cfg.prospects_dir / (prospect + '.json'))}`."
+        )
+        await update(interaction, text, Colors.DANGER)
+        return
+    names = [export.filename] if len(parts) == 1 else [f"{export.filename}.{i:03d}" for i in range(1, len(parts) + 1)]
+    try:
+        for part, name in zip(parts, names, strict=True):
+            await interaction.followup.send(file=discord.File(io.BytesIO(part), filename=name), ephemeral=True)
+    except discord.HTTPException as e:
+        log.exception("Sending %s to Discord failed", export.filename)
+        await update(interaction, f"❌ Envoi sur Discord impossible : {e}", Colors.DANGER)
+        return
+    text = (
+        f"✅ **{md(prospect)}** : `{code(export.filename)}` — {bk.human_size(len(export.data))} "
+        f"(partie de {bk.human_size(export.json_size)} décompressée)."
+    )
+    if len(parts) > 1:
+        text += (
+            f"\n\n📦 Fichier trop gros pour un seul envoi : découpé en **{len(parts)} morceaux** "
+            f"(`.001` à `.{len(parts):03d}`). Télécharge-les tous dans le même dossier, puis :\n"
+            "• avec **7-Zip** : clic droit sur le `.001` → *Extraire* ;\n"
+            f"• ou sous Windows : `copy /b {code(export.filename)}.0* {code(export.filename)}` puis ouvre le `.zip`."
+        )
+    if not export.valid:
+        text += "\n\n⚠️ Le jeu écrivait la sauvegarde à ce moment-là : le fichier peut être incomplet, réessaie dans un instant."
+    await update(interaction, text, Colors.SUCCESS if export.valid else Colors.WARNING)
+    await bot.notifier.action(interaction.user, action, f"📥 {bk.human_size(len(export.data))}, {len(parts)} fichier(s)")
 
 
 async def _restore_pick_prospect(bot: "WardenBot", interaction: discord.Interaction) -> None:
@@ -223,7 +316,7 @@ async def _restore_pick_point(bot: "WardenBot", interaction: discord.Interaction
             bk.list_restore_points, cfg.prospects_dir, cfg.backup_dir, prospect, cfg.prospects_rel, cfg.timezone
         )
     except bk.BackupError as e:
-        await update(interaction, f"❌ {e}", Colors.DANGER)
+        await update(interaction, f"❌ {md(e)}", Colors.DANGER)
         return
     options = tuple(restore_point_label(p, cfg.timezone) for p in points if len(p.token) <= 100)[:25]
     if not options:
@@ -302,7 +395,7 @@ async def _restore_run(bot: "WardenBot", interaction: discord.Interaction, token
                 color = Colors.SUCCESS
             except Exception as e:  # noqa: BLE001 - files untouched: restart anyway
                 log.exception("Échec de restauration")
-                text, color = f"❌ Restauration impossible : {e}\nLa partie actuelle n'a pas été modifiée.", Colors.DANGER
+                text, color = f"❌ Restauration impossible : {md(e)}\nLa partie actuelle n'a pas été modifiée.", Colors.DANGER
             await update(interaction, f"{text}\n\n▶️ Redémarrage du serveur…", Colors.WARNING)
             await asyncio.to_thread(bot.docker.start)
             text += "\n▶️ Serveur redémarré."
@@ -311,7 +404,7 @@ async def _restore_run(bot: "WardenBot", interaction: discord.Interaction, token
         return
     except Exception as e:  # noqa: BLE001
         log.exception("Échec pendant la restauration")
-        text, color = f"❌ Erreur : {e}\n👉 Vérifie l'état du serveur et démarre-le si besoin.", Colors.DANGER
+        text, color = f"❌ Erreur : {md(e)}\n👉 Vérifie l'état du serveur et démarre-le si besoin.", Colors.DANGER
     await update(interaction, text, color)
     await bot.notifier.action(interaction.user, action, text, color)
     await bot.refresh_backups_panel(force=True)
@@ -388,7 +481,7 @@ async def _open_setting_modal(bot: "WardenBot", interaction: discord.Interaction
         return
     if defn.storage == "ini":
         try:
-            ini = await asyncio.to_thread(ss.read_ini, bot.config.server_settings_file)
+            ini = await asyncio.to_thread(ss.read_ini, bot.config.server_settings_file, root=bot.config.data_dir)
         except (OSError, UnicodeError) as e:
             await respond(interaction, f"❌ ServerSettings.ini illisible : {e}", Colors.DANGER)
             return

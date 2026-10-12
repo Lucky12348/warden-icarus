@@ -60,9 +60,10 @@ class ContainerStatus:
 
 @dataclass(frozen=True)
 class Stats:
-    cpu_percent: float | None
-    mem_used: int | None
+    cpu_percent: float | None  # % of the whole VM (all cores), not of one core
+    mem_used: int | None  # container memory without the cache (usage - inactive_file)
     mem_limit: int | None
+    cpu_count: int | None = None
 
 
 def parse_docker_time(value: str | None) -> datetime | None:
@@ -82,17 +83,23 @@ def parse_docker_time(value: str | None) -> datetime | None:
     return dt.replace(tzinfo=timezone(sign * timedelta(hours=hours, minutes=minutes)))
 
 
-def compute_cpu_percent(stats: dict[str, Any]) -> float | None:
+def compute_cpu(stats: dict[str, Any]) -> tuple[float | None, int | None]:
+    """CPU used by the container as a % of the whole VM, and the number of cores.
+
+    `system_cpu_usage` already counts every core of the host, so cpu_delta / sys_delta is the
+    share of the whole VM (what Proxmox shows). `docker stats` multiplies it by the number of
+    cores to express it as a % of one core (up to 400 % on 4 cores): not done here.
+    """
     try:
         cpu, pre = stats["cpu_stats"], stats["precpu_stats"]
         cpu_delta = cpu["cpu_usage"]["total_usage"] - pre["cpu_usage"]["total_usage"]
         sys_delta = cpu["system_cpu_usage"] - pre["system_cpu_usage"]
-        cpus = cpu.get("online_cpus") or len(cpu["cpu_usage"].get("percpu_usage") or []) or 1
+        cpus = cpu.get("online_cpus") or len(cpu["cpu_usage"].get("percpu_usage") or []) or None
     except (KeyError, TypeError):
-        return None
+        return None, None
     if sys_delta <= 0 or cpu_delta < 0:
-        return 0.0
-    return cpu_delta / sys_delta * cpus * 100.0
+        return 0.0, cpus
+    return min(100.0, cpu_delta / sys_delta * 100.0), cpus
 
 
 def compute_memory(stats: dict[str, Any]) -> tuple[int | None, int | None]:
@@ -166,7 +173,8 @@ class IcarusDocker:
         container = self._container()
         raw = container.stats(stream=False)
         used, limit = compute_memory(raw)
-        return Stats(compute_cpu_percent(raw), used, limit)
+        cpu_percent, cpu_count = compute_cpu(raw)
+        return Stats(cpu_percent, used, limit, cpu_count)
 
     def logs(self, since: int) -> Iterator[str]:
         """Follow the logs (blocking) from `since`; ends when the container stops."""

@@ -91,3 +91,32 @@ def test_recent_logs_are_normalized_and_skip_empty_lines():
     bot = SimpleNamespace(docker=SimpleNamespace(tail=lambda n: [real("LogInit: Display: Engine is initialized."), real(""), ""]))
     lines = asyncio.run(WardenBot.recent_logs(bot, 50))
     assert lines == ["[icarus-server] LogInit: Display: Engine is initialized."]
+
+
+def test_logs_file_keeps_the_most_recent_lines():
+    from warden.commands import logs_file
+
+    lines = [f"ligne {i}" for i in range(10)]
+    payload, kept = logs_file(lines, 10_000)
+    assert kept == 10 and payload.decode() == "\n".join(lines) + "\n"
+    payload, kept = logs_file(lines, 25)  # "ligne N\n" = 8 bytes: 3 lines fit
+    assert kept == 3 and payload.decode() == "ligne 7\nligne 8\nligne 9\n"
+    assert logs_file(["x" * 100], 10) == (b"", 0)
+
+
+def test_docker_stats_are_cached_for_open_commands():
+    calls = []
+
+    def stats():
+        calls.append(1)
+        return "stats"
+
+    bot = SimpleNamespace(
+        docker=SimpleNamespace(stats=stats), _stats_lock=asyncio.Lock(), _stats_cache=None
+    )
+
+    async def many_clicks():
+        return await asyncio.gather(*(WardenBot._cached_stats(bot) for _ in range(20)))
+
+    assert asyncio.run(many_clicks()) == ["stats"] * 20
+    assert len(calls) == 1  # 20 clicks, a single docker stats call
