@@ -72,6 +72,7 @@ class Config:
     a2s_port: int
     panel_refresh_seconds: int
     player_poll_seconds: int
+    player_leave_grace_seconds: int  # a departure is announced only after this absence (reconnections)
     stop_timeout: int
     recreate_timeout: int
     timezone: ZoneInfo
@@ -169,6 +170,7 @@ class Config:
             a2s_port=_int(env, "A2S_PORT", 32784),
             panel_refresh_seconds=max(15, _int(env, "PANEL_REFRESH_SECONDS", 60)),
             player_poll_seconds=max(5, _int(env, "PLAYER_POLL_SECONDS", 20)),
+            player_leave_grace_seconds=max(0, _int(env, "PLAYER_LEAVE_GRACE_SECONDS", 120)),
             stop_timeout=max(MIN_STOP_TIMEOUT, _int(env, "STOP_TIMEOUT", DEFAULT_STOP_TIMEOUT)),
             recreate_timeout=max(60, _int(env, "RECREATE_TIMEOUT", 600)),
             timezone=tz,

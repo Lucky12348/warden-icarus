@@ -472,23 +472,24 @@ class WardenBot(discord.Client):
         return changed_at is not None and time.monotonic() - changed_at < UPDATE_LINE_WINDOW
 
     async def _player_loop(self) -> None:
-        previous: pl.Snapshot | None = None
+        presence = pl.PresenceTracker(self.config.player_leave_grace_seconds)
         while True:
             try:
                 status = await asyncio.to_thread(self.docker.status)
                 if not status.running:
-                    previous, self.players = None, None
+                    presence.reset()
+                    self.players = None
                 else:
                     snap = await pl.query(self.config.a2s_host, self.config.a2s_port)
                     changed = (snap is None) != (self.players is None) or (
                         snap is not None and self.players is not None and snap.count != self.players.count
                     )
                     self.players = snap
-                    if snap is not None:
-                        if self.config.player_detection in ("a2s", "both"):
-                            for _kind, text in pl.diff(previous, snap):
-                                await self.notifier.post(text)
-                        previous = snap
+                    # Arrivals at once, departures after PLAYER_LEAVE_GRACE_SECONDS (reconnections).
+                    events = presence.update(snap, time.monotonic())
+                    if self.config.player_detection in ("a2s", "both"):
+                        for _kind, text in events:
+                            await self.notifier.post(text)
                     if changed:
                         self.schedule_panel_refresh()
             except Exception:

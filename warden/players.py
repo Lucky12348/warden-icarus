@@ -90,6 +90,71 @@ def diff(previous: Snapshot | None, current: Snapshot | None) -> list[tuple[str,
     return events
 
 
+class PresenceTracker:
+    """Arrivals/departures for the logs channel, without the reconnection false positives.
+
+    When a player clicks Connect, Icarus connects them to the lobby, drops the connection while
+    the prospect loads, then reconnects them: A2S sees 1 -> 0 -> 1 within a minute. Arrivals are
+    therefore announced at once, but a departure only once the player has been missing for
+    `leave_grace` seconds; coming back within that time cancels it (nothing is published).
+    A missing snapshot (A2S not answering) changes nothing.
+    """
+
+    def __init__(self, leave_grace: float) -> None:
+        self.leave_grace = leave_grace
+        self.reset()
+
+    def reset(self) -> None:
+        """Server stopped: forget everything (the next snapshot is a new baseline)."""
+        self.announced: Snapshot | None = None  # state as last reported in the logs channel
+        self._count_missing_since: float | None = None
+        self._names_missing_since: dict[str, float] = {}
+
+    def update(self, current: Snapshot | None, now: float) -> list[tuple[str, str]]:
+        if current is None:
+            return []
+        previous = self.announced
+        if previous is None:
+            self.announced = current
+            return []
+        if previous.names is None or current.names is None:
+            return self._update_by_count(previous, current, now)
+        return self._update_by_names(previous, current, now)
+
+    def _update_by_count(self, previous: Snapshot, current: Snapshot, now: float) -> list[tuple[str, str]]:
+        self._names_missing_since.clear()
+        if current.count >= previous.count:
+            self._count_missing_since = None
+            self.announced = current
+            return diff(previous, current) if current.count > previous.count else []
+        if self._count_missing_since is None:
+            self._count_missing_since = now
+        if now - self._count_missing_since < self.leave_grace:
+            return []  # maybe a reconnection: wait
+        self._count_missing_since = None
+        self.announced = current
+        return diff(previous, current)
+
+    def _update_by_names(self, previous: Snapshot, current: Snapshot, now: float) -> list[tuple[str, str]]:
+        self._count_missing_since = None
+        before, after = Counter(previous.names), Counter(current.names)
+        missing = before - after
+        for name in list(self._names_missing_since):
+            if not missing[name]:
+                del self._names_missing_since[name]  # back in time: departure cancelled
+        for name in missing:
+            self._names_missing_since.setdefault(name, now)
+        known = before + (after - before)  # arrivals: at once
+        for name, since in list(self._names_missing_since.items()):
+            if now - since >= self.leave_grace:  # departure confirmed
+                known[name] -= missing[name]
+                del self._names_missing_since[name]
+        names = tuple(sorted(known.elements(), key=str.lower))
+        self.announced = Snapshot(current.server_name, len(names), current.max_players, names)
+        reported = Snapshot(current.server_name, current.count, current.max_players, names)
+        return diff(previous, reported)
+
+
 def players_line(snapshot: Snapshot | None) -> str:
     if snapshot is None:
         return "👥 Joueurs : — *(le serveur ne répond pas aux requêtes)*"

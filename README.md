@@ -130,6 +130,7 @@ Apply with `docker compose up -d`, then enable the **ntfy** toggle in the settin
 
 ### Players
 A2S queries `127.0.0.1:32784` every 20 s. If Icarus does not return names, the panel shows "2/8 joueurs" and the logs channel announces "Un joueur a rejoint la partie".
+Arrivals are announced at once; a departure only once the player has been missing for `PLAYER_LEAVE_GRACE_SECONDS` (120 s by default). Joining briefly disconnects the player (lobby, then prospect loading), which would otherwise show "a rejoint / a quitté / a rejoint" within a minute; a reconnection within the grace period publishes nothing. `0` restores immediate departures.
 Log-based detection can be enabled later (`PLAYER_DETECTION=logs` or `both`, with `join`/`leave` patterns in a patterns file, see below).
 
 ### Backups
